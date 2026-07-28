@@ -5,6 +5,8 @@ import { getOpenPrs } from '../db/pullRequests';
 import { buildListPageViewModel } from '../lib/listPageViewModel';
 import { VerdictBadge } from './components/VerdictBadge';
 import { PollStatusBanner } from './components/PollStatusBanner';
+import { RecheckButton } from './components/RecheckButton';
+import { Card } from './components/ui/card';
 
 export const dynamic = 'force-dynamic';
 
@@ -20,77 +22,88 @@ export default function ListPage() {
   });
 
   return (
-    <main>
-      <h1>{vm.repo}</h1>
-      <PollStatusBanner lastPollAt={vm.lastPollAt} lastPollStatus={vm.pollStatus} lastPollError={vm.pollError} />
-      <table>
-        <thead>
-          <tr>
-            <th>PR</th>
-            <th>Title</th>
-            <th>Branch</th>
-            <th>Author</th>
-            <th>Verdict</th>
-            <th>Critical+High</th>
-            <th>Last reviewed</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          {vm.rows.map((row) => (
-            // Server Components can't attach an onClick handler to the
-            // <tr> itself (that would require a Client Component), so
-            // "clicking a row navigates" is satisfied instead by making
-            // every data cell in the row a full-cell <Link> (styled to
-            // `display: block` so the whole cell area, not just the
-            // text, is clickable) - only the "Re-check now" form/button
-            // cell is excluded, since it must submit a POST rather than
-            // navigate.
-            <tr key={row.prNumber}>
-              <td>
-                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
-                  #{row.prNumber}
-                </Link>
-              </td>
-              <td>
-                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
-                  {row.title}
-                </Link>
-              </td>
-              <td>
-                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
-                  {row.branch}
-                </Link>
-              </td>
-              <td>
-                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
-                  {row.author}
-                </Link>
-              </td>
-              <td>
-                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
-                  {row.isInProgress ? 'Reviewing…' : <VerdictBadge verdict={row.badgeVerdict} />}
-                </Link>
-              </td>
-              <td>
-                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
-                  {row.criticalHighCount ?? '-'}
-                </Link>
-              </td>
-              <td>
-                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
-                  {row.lastReviewedAt ?? '-'}
-                </Link>
-              </td>
-              <td>
-                <form action={`/api/recheck/${row.prNumber}`} method="post">
-                  <button type="submit">Re-check now</button>
-                </form>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <main className="mx-auto flex max-w-4xl flex-col gap-6 px-6 py-10">
+      <div>
+        <h1 className="text-2xl font-semibold text-[#FAFAFA]">{vm.repo}</h1>
+        <div className="mt-3">
+          <PollStatusBanner lastPollAt={vm.lastPollAt} lastPollStatus={vm.pollStatus} lastPollError={vm.pollError} />
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2.5">
+        {vm.rows.map((row) => (
+          <Card
+            key={row.prNumber}
+            className={`relative flex flex-col items-stretch gap-3 border-[#27272A] bg-[#18181B] p-4 transition-colors duration-200 ease-out hover:border-[#3B82F6]/40 sm:flex-row sm:items-center sm:justify-between ${
+              row.isInProgress ? 'opacity-70' : ''
+            }`}
+          >
+            {/* Full-card clickable overlay: an absolutely-positioned
+                <Link> stretched to cover the entire card (inset-0).
+                This is a real, keyboard-focusable, tabbable link (no
+                `tabIndex={-1}` - removing it from tab order would make
+                the card unreachable by keyboard) with an sr-only label
+                for screen readers. The visible content wrapper below it
+                has `pointer-events-none` so mouse clicks/taps pass
+                *through* the content (title, branch, author, verdict,
+                severity count, and the gaps between them) straight to
+                this overlay underneath - the content is still visually
+                on top (z-[1] > z-0) and fully legible/selectable-looking,
+                it just doesn't intercept clicks itself. RecheckButton is
+                wrapped in its own `relative z-10 pointer-events-auto`
+                container so it re-enables pointer events and sits above
+                everything, remaining independently clickable - an
+                interactive <button> nested inside an <a> would be
+                invalid HTML/inaccessible, so this overlay approach keeps
+                them as non-nested siblings while still covering the
+                full card for every other click target. */}
+            <Link
+              href={`/pr/${row.prNumber}`}
+              className="absolute inset-0 z-0 rounded-[inherit] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3B82F6]"
+            >
+              <span className="sr-only">
+                View PR #{row.prNumber}: {row.title}
+              </span>
+            </Link>
+
+            <div className="pointer-events-none relative z-[1] flex flex-1 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-sm text-muted-foreground">#{row.prNumber}</span>
+                  <span className="font-medium text-[#FAFAFA]">{row.title}</span>
+                </div>
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                  <span className="font-mono">{row.branch}</span>
+                  <span>{row.author}</span>
+                  <span>Last reviewed {row.lastReviewedAt ?? '-'}</span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-4">
+                {row.isInProgress ? (
+                  <span className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <span className="h-2 w-2 animate-pulse rounded-full bg-[#3B82F6]" />
+                    Reviewing…
+                  </span>
+                ) : (
+                  <VerdictBadge verdict={row.badgeVerdict} />
+                )}
+                {/* Severity count reflects the last *successful* review
+                    (per listPageViewModel's comment on criticalHighCount)
+                    and stays visible even mid-recheck, since it's still
+                    meaningful reference data while a new review runs.
+                    Falls back to '-' (matching the original table cell's
+                    behavior) rather than disappearing when null. */}
+                <span className="text-sm text-muted-foreground">Crit+High: {row.criticalHighCount ?? '-'}</span>
+              </div>
+            </div>
+
+            <div className="relative z-10 pointer-events-auto">
+              <RecheckButton prNumber={row.prNumber} disabled={row.isInProgress} />
+            </div>
+          </Card>
+        ))}
+      </div>
     </main>
   );
 }
