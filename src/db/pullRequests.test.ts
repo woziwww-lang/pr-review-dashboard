@@ -159,18 +159,20 @@ describe('pullRequests repository', () => {
     expect(failed.last_attempted_at).toBeTruthy();
   });
 
-  it('resetStuckReviews flips pending/reviewing rows to failed', () => {
-    upsertOpenPr(db, basePr); // pending
+  it('resetStuckReviews re-queues interrupted "reviewing" rows back to pending, not failed', () => {
+    upsertOpenPr(db, basePr); // pending, never started — must be left alone
     upsertOpenPr(db, { ...basePr, prNumber: 2 });
-    markReviewing(db, getByNumber(db, 'owner/name', 2)!.id);
+    markReviewing(db, getByNumber(db, 'owner/name', 2)!.id); // mid-flight when "restart" happens
 
-    resetStuckReviews(db);
+    const changed = resetStuckReviews(db);
 
-    expect(getByNumber(db, 'owner/name', 1)!.review_status).toBe('failed');
-    expect(getByNumber(db, 'owner/name', 1)!.error_message).toBe(
-      'Interrupted by process restart'
-    );
-    expect(getByNumber(db, 'owner/name', 2)!.review_status).toBe('failed');
+    expect(changed).toBe(1);
+    // Untouched: was never started, nothing to recover from.
+    expect(getByNumber(db, 'owner/name', 1)!.review_status).toBe('pending');
+    expect(getByNumber(db, 'owner/name', 1)!.error_message).toBeNull();
+    // Re-queued (not fabricated as failed): will be retried on the next poll.
+    expect(getByNumber(db, 'owner/name', 2)!.review_status).toBe('pending');
+    expect(getByNumber(db, 'owner/name', 2)!.error_message).toBeNull();
   });
 
   it('resetStuckReviews does not touch draft PRs left at pending (never enqueued)', () => {

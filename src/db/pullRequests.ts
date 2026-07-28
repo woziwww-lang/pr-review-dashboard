@@ -46,8 +46,9 @@ export interface PullRequestRow {
  *   filtered out of `getOpenPrs()` (see below), the Chunk 3 poller's
  *   enqueue decision explicitly skips any row with `is_draft=1`
  *   regardless of `review_status`, and `resetStuckReviews()` (below)
- *   likewise excludes `is_draft=1` rows so a never-enqueued draft is
- *   never fabricated into a "review failed" state after a restart.
+ *   likewise excludes `is_draft=1` rows and never touches `'pending'` rows
+ *   at all — a draft (or any never-started PR) is never fabricated into
+ *   a "review failed" or re-queued state after a restart.
  * - On UPDATE (PR already tracked), `review_status` is deliberately left
  *   untouched here — whether an existing PR needs re-review because its
  *   `head_sha` changed is decided separately by `lib/decision.ts` in
@@ -178,18 +179,31 @@ export function markPending(db: Database.Database, id: number): void {
   ).run({ id });
 }
 
-export function resetStuckReviews(db: Database.Database): void {
-  // Only touches non-draft rows: draft PRs are inserted with the schema
-  // default review_status='pending' too (see upsertOpenPr above), but they
-  // were never actually enqueued for review (the poller skips is_draft=1
-  // rows), so they must not be flipped to 'failed' here — that would
-  // fabricate a bogus "review failed" banner for a PR that was never
-  // reviewed in the first place.
-  db.prepare(
-    `UPDATE pull_requests SET
-       review_status = 'failed',
-       error_message = 'Interrupted by process restart',
-       last_attempted_at = @now
-     WHERE review_status IN ('pending', 'reviewing') AND is_draft = 0`
-  ).run({ now: new Date().toISOString() });
+export function resetStuckReviews(db: Database.Database): number {
+  // Only 'reviewing' rows are genuinely "stuck": a process restart killed
+  // the in-flight `copilot -p` child before it could report a result. That
+  // is not evidence the review actually failed — it's evidence the review
+  // never got a chance to finish — so these are re-queued back to
+  // 'pending' (to be retried on the next poll tick) rather than flipped to
+  // 'failed'. Fabricating a 'failed' verdict here previously produced a
+  // misleading "review failed" banner on every local dev-server restart,
+  // even though no review had actually errored.
+  //
+  // 'pending' rows are deliberately left untouched: they were never
+  // started in the first place (a restart doesn't interrupt anything for
+  // them), so they need no reset — they'll simply be picked up by the
+  // next poll tick as normal. This also naturally excludes draft PRs,
+  // which sit at the schema default review_status='pending' forever
+  // because the poller skips is_draft=1 rows — they must never be
+  // touched here, since they were never enqueued for review to begin
+  // with.
+  const result = db
+    .prepare(
+      `UPDATE pull_requests SET
+       review_status = 'pending',
+       error_message = NULL
+     WHERE review_status = 'reviewing' AND is_draft = 0`
+    )
+    .run();
+  return result.changes;
 }
