@@ -155,6 +155,15 @@ export function markFailed(db: Database.Database, id: number, errorMessage: stri
   ).run({ id, errorMessage, now });
 }
 
+export function markPending(db: Database.Database, id: number): void {
+  db.prepare(
+    `UPDATE pull_requests SET
+       review_status = 'pending',
+       error_message = NULL
+     WHERE id = @id`
+  ).run({ id });
+}
+
 export function resetStuckReviews(db: Database.Database): void {
   // Only touches non-draft rows: draft PRs are inserted with the schema
   // default review_status='pending' too (see upsertOpenPr above), but they

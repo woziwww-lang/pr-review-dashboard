@@ -7,6 +7,7 @@ import {
   markReviewing,
   markDone,
   markFailed,
+  markPending,
   getOpenPrs,
   getByNumber,
   resetStuckReviews,
@@ -179,5 +180,29 @@ describe('pullRequests repository', () => {
     const draft = getByNumber(db, 'owner/name', 3)!;
     expect(draft.review_status).toBe('pending');
     expect(draft.error_message).toBeNull();
+  });
+
+  it('markPending resets status to pending and clears error, preserving prior review data', () => {
+    upsertOpenPr(db, basePr);
+    const row = getByNumber(db, 'owner/name', 1)!;
+    markDone(db, row.id, {
+      verdict: 'approve',
+      severityCritical: 0,
+      severityHigh: 0,
+      severityMedium: 0,
+      severityLow: 0,
+      reviewedHeadSha: 'sha1',
+      rawReportMd: '# ok',
+    });
+    markFailed(db, row.id, 'transient error');
+
+    markPending(db, row.id);
+
+    const pending = getByNumber(db, 'owner/name', 1)!;
+    expect(pending.review_status).toBe('pending');
+    expect(pending.error_message).toBeNull();
+    expect(pending.verdict).toBe('approve'); // preserved until new review completes
+    expect(pending.reviewed_head_sha).toBe('sha1'); // preserved
+    expect(pending.raw_report_md).toBe('# ok'); // preserved
   });
 });
