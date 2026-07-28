@@ -33,7 +33,7 @@ describe('instrumentation register()', () => {
     resetStuckReviewsMock.mockClear();
     withPollLockMock.mockClear();
     runPollTickMock.mockClear();
-    (globalThis as any).__prDashboardCronRegistered = undefined;
+    (globalThis as { __prDashboardCronRegistered?: boolean }).__prDashboardCronRegistered = undefined;
     exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
       throw new Error(`process.exit(${code}) called`);
     }) as never);

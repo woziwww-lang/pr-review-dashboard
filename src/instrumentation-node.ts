@@ -7,7 +7,6 @@ import { withPollLock } from './lib/queue';
 import { runPollTick } from './lib/poller';
 
 declare global {
-  // eslint-disable-next-line no-var
   var __prDashboardCronRegistered: boolean | undefined;
 }
 
@@ -20,7 +19,6 @@ export async function register(): Promise<void> {
 
   const result = parseTargetRepo(process.env.TARGET_REPO);
   if (!result.ok) {
-    // eslint-disable-next-line no-console
     console.error(`FATAL: ${result.error}`);
     process.exit(1);
     return;

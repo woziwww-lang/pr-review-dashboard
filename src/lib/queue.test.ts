@@ -4,7 +4,7 @@ import { isPollInProgress, withPollLock } from './queue';
 describe('poll-tick mutex', () => {
   beforeEach(() => {
     // Reset the globalThis-keyed flag between tests.
-    (globalThis as any).__prDashboardPollInProgress = undefined;
+    (globalThis as { __prDashboardPollInProgress?: boolean }).__prDashboardPollInProgress = undefined;
   });
 
   it('is not in progress initially', () => {

@@ -7,7 +7,7 @@ describe('createTestDb', () => {
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type='table'")
       .all()
-      .map((row: any) => row.name);
+      .map((row) => (row as { name: string }).name);
 
     expect(tables).toEqual(
       expect.arrayContaining(['config', 'pull_requests', 'findings'])
