@@ -20,9 +20,11 @@ pr-review-dashboard/
   tsconfig.json
   next.config.ts
   .env.local.example          # TARGET_REPO=owner/name
-  instrumentation.ts          # registers cron job + crash recovery, once per process
   vitest.config.ts
   src/
+    instrumentation.ts        # registers cron job + crash recovery, once per process
+                               # (lives under src/ per Next.js --src-dir convention)
+    instrumentation.test.ts
     db/
       schema.sql              # CREATE TABLE statements (config, pull_requests, findings)
       client.ts                # opens/creates the sqlite file, runs schema.sql once, exports db singleton
@@ -34,13 +36,13 @@ pr-review-dashboard/
       findings.ts              # replaceFindings(prId, findings[]), getByPrId
       findings.test.ts
     lib/
-      gh.ts                     # listOpenPrs(repo): shells out to `gh pr list`, parses JSON
+      gh.ts                     # fetchOpenPrs(repo): shells out to `gh pr list`, parses JSON
       gh.test.ts
-      repoCache.ts              # ensureBareClone, fetchAll, ensureWorktree(prNumber, headSha, baseBranch)
+      repoCache.ts              # ensureBareRepo(repo), addOrUpdateWorktree(repo, prNumber, headSha)
       repoCache.test.ts
       reviewPrompt.ts           # buildReviewPrompt(pr): returns the string passed to `copilot -p`
       reviewPrompt.test.ts
-      reviewRunner.ts           # runReview(worktreePath, prompt): spawns `copilot -p`, enforces timeout, returns {stdout, exitCode}
+      reviewRunner.ts           # runReview(cwd, prompt, timeoutMs): spawns `copilot -p`, enforces timeout, returns {success, output, errorMessage?}
       reviewRunner.test.ts
       parseReviewOutput.ts      # parseReviewOutput(rawOutput): extracts trailing JSON block -> {findings, verdict} + rawMarkdown
       parseReviewOutput.test.ts
@@ -50,8 +52,8 @@ pr-review-dashboard/
       queue.test.ts
       poller.ts                   # orchestrates one full poll tick end-to-end
       poller.test.ts
-      startup.ts                  # resets stuck pending/reviewing rows to failed on boot
-      startup.test.ts
+      startupConfig.ts             # pure TARGET_REPO env-var validation (owner/name format check)
+      startupConfig.test.ts
     app/
       layout.tsx
       page.tsx                    # List Page (Server Component)
@@ -67,9 +69,10 @@ pr-review-dashboard/
 **Responsibilities:**
 - `db/*`: all SQLite access. Nothing outside this folder touches `better-sqlite3` directly.
 - `lib/gh.ts`, `lib/repoCache.ts`, `lib/reviewRunner.ts`: thin wrappers around external processes (`gh`, `git`, `copilot`). Each does one external-process concern and is independently mockable.
-- `lib/parseReviewOutput.ts`, `lib/decision.ts`: pure functions, no I/O — the easiest things to unit test exhaustively.
+- `lib/parseReviewOutput.ts`, `lib/decision.ts`, `lib/startupConfig.ts`: pure functions, no I/O — the easiest things to unit test exhaustively.
 - `lib/poller.ts`: the only place that wires `gh.ts` + `repoCache.ts` + `reviewRunner.ts` + `parseReviewOutput.ts` + `db/*` together for one poll tick. This is also called directly by the "Re-check now" API route for a single PR.
 - `lib/queue.ts`: in-memory (not persisted) single-flight + mutex state, isolated so it can be unit tested without spawning real processes.
+- `instrumentation.ts`: the only place that wires `lib/startupConfig.ts` (validate env, exit on failure) + `db/pullRequests.ts`'s `resetStuckReviews` (crash recovery) + `node-cron` + `lib/queue.ts` + `lib/poller.ts` together at process boot. Deliberately not split into a separate `lib/startup.ts` — the boot sequence is a handful of sequential calls with no independent reusable logic, so a wrapper module would just add indirection.
 - `app/*`: Next.js UI, reads only through `db/*` functions, never touches `gh`/`git`/`copilot` directly.
 
 ---
@@ -2110,6 +2113,832 @@ reviewPrompt: 1, repoCache: 6, reviewRunner: 4 — 49 tests total).
 ```bash
 git add -A
 git commit -m "test: verify chunk 3 repo cache and review execution passes as a whole" --allow-empty
+```
+
+---
+
+## Chunk 4: Poller orchestration + cron scheduling
+
+This chunk wires Chunks 1–3 together into the actual poll loop: fetching
+open PRs, deciding what needs review, running reviews serially with the
+single-flight rule, and registering the whole thing on a 5-minute cron
+inside the single Next.js process. It also adds startup-time validation
+of `TARGET_REPO` and crash recovery for rows stuck `pending`/`reviewing`
+from a previous process.
+
+### Task 4.1: `getPendingPrs()` on the pull_requests repository
+
+**Files:**
+- Modify: `src/db/pullRequests.ts`
+- Modify: `src/db/pullRequests.test.ts`
+
+The poller needs to fetch the queue of PRs awaiting review after each
+poll's upsert/decision pass.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `src/db/pullRequests.test.ts` (import `getPendingPrs` alongside the
+existing imports):
+
+```typescript
+  it('getPendingPrs returns only pending, non-draft rows for the given repo, oldest first', () => {
+    upsertOpenPr(db, basePr); // pending
+    upsertOpenPr(db, { ...basePr, prNumber: 2 });
+    markReviewing(db, getByNumber(db, 'owner/name', 2)!.id); // not pending anymore
+    upsertOpenPr(db, { ...basePr, prNumber: 3 }); // pending
+    upsertOpenPr(db, { ...basePr, prNumber: 4, isDraft: true }); // pending but a draft — never queued
+    upsertOpenPr(db, { ...basePr, repo: 'other/repo', prNumber: 1 }); // different repo
+
+    const pending = getPendingPrs(db, 'owner/name');
+
+    expect(pending.map((r) => r.pr_number)).toEqual([1, 3]);
+  });
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/db/pullRequests.test.ts`
+Expected: FAIL — `getPendingPrs is not a function`.
+
+- [ ] **Step 3: Add `getPendingPrs()` to `src/db/pullRequests.ts`**
+
+```typescript
+// Excludes drafts: a draft PR's row can sit at review_status='pending'
+// indefinitely (upsertOpenPr's insert default, see Chunk 1), but drafts
+// are never actually supposed to be reviewed or shown — this is the
+// query the poller's queue-processing loop uses, so it must filter them
+// out here rather than relying on callers to remember to do so.
+export function getPendingPrs(db: Database.Database, repo: string): PullRequestRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM pull_requests WHERE repo = ? AND review_status = 'pending' AND is_draft = 0
+       ORDER BY id ASC`
+    )
+    .all(repo) as PullRequestRow[];
+}
+```
+
+Also add `getPendingPrs` to the import list at the top of
+`src/db/pullRequests.test.ts`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/db/pullRequests.test.ts`
+Expected: PASS, 12 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/db/pullRequests.ts src/db/pullRequests.test.ts
+git commit -m "feat(db): add getPendingPrs to fetch the review queue"
+```
+
+---
+
+### Task 4.2: Poll-tick mutex
+
+**Files:**
+- Create: `src/lib/queue.ts`
+- Test: `src/lib/queue.test.ts`
+
+This is distinct from the single-flight rule already enforced by
+`decision.ts`/`review_status` (which prevents re-enqueuing one PR that's
+already `pending`/`reviewing`). This mutex prevents two *entire poll
+ticks* from running concurrently — e.g. if a slow `copilot` invocation is
+still processing the queue from the previous tick when the next 5-minute
+cron fires, the new tick must be skipped entirely rather than starting a
+second overlapping poll. Uses a `globalThis`-keyed flag (not a plain
+module-level variable) for the same reason `instrumentation.ts` needs one
+in Task 4.5: Next.js dev mode can reload this module without restarting
+the process, which would reset a plain module-level variable but not a
+`globalThis` property.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/lib/queue.test.ts`:
+```typescript
+import { describe, it, expect, beforeEach } from 'vitest';
+import { isPollInProgress, withPollLock } from './queue';
+
+describe('poll-tick mutex', () => {
+  beforeEach(() => {
+    // Reset the globalThis-keyed flag between tests.
+    (globalThis as any).__prDashboardPollInProgress = undefined;
+  });
+
+  it('is not in progress initially', () => {
+    expect(isPollInProgress()).toBe(false);
+  });
+
+  it('runs the callback and marks in-progress for its duration', async () => {
+    let sawInProgress = false;
+    await withPollLock(async () => {
+      sawInProgress = isPollInProgress();
+    });
+    expect(sawInProgress).toBe(true);
+    expect(isPollInProgress()).toBe(false); // released after completion
+  });
+
+  it('releases the lock even if the callback throws', async () => {
+    await expect(
+      withPollLock(async () => {
+        throw new Error('boom');
+      })
+    ).rejects.toThrow('boom');
+    expect(isPollInProgress()).toBe(false);
+  });
+
+  it('skips a second overlapping call while the first is still running', async () => {
+    let resolveFirst!: () => void;
+    const firstDone = new Promise<void>((resolve) => {
+      resolveFirst = resolve;
+    });
+
+    const firstCallPromise = withPollLock(async () => {
+      await firstDone;
+      return 'first-result';
+    });
+
+    // Second call happens while the first is still in-flight.
+    const secondResult = await withPollLock(async () => 'second-result');
+    expect(secondResult).toBe('skipped');
+
+    resolveFirst();
+    const firstResult = await firstCallPromise;
+    expect(firstResult).toBe('first-result');
+    expect(isPollInProgress()).toBe(false);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/lib/queue.test.ts`
+Expected: FAIL — `Cannot find module './queue'`.
+
+- [ ] **Step 3: Write `src/lib/queue.ts`**
+
+```typescript
+declare global {
+  // eslint-disable-next-line no-var
+  var __prDashboardPollInProgress: boolean | undefined;
+}
+
+export function isPollInProgress(): boolean {
+  return globalThis.__prDashboardPollInProgress === true;
+}
+
+/**
+ * Runs `fn` only if no other poll tick is currently in progress. Returns
+ * `'skipped'` immediately (without calling `fn`) if one is. The lock is
+ * always released — even if `fn` throws — so a crashed poll tick can
+ * never permanently wedge future ticks.
+ */
+export async function withPollLock<T>(fn: () => Promise<T>): Promise<T | 'skipped'> {
+  if (isPollInProgress()) return 'skipped';
+  globalThis.__prDashboardPollInProgress = true;
+  try {
+    return await fn();
+  } finally {
+    globalThis.__prDashboardPollInProgress = false;
+  }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/lib/queue.test.ts`
+Expected: PASS, 4 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/lib/queue.ts src/lib/queue.test.ts
+git commit -m "feat(lib): add poll-tick mutex to prevent overlapping poll ticks"
+```
+
+---
+
+### Task 4.3: Poller orchestration
+
+**Files:**
+- Create: `src/lib/poller.ts`
+- Test: `src/lib/poller.test.ts`
+
+This is the integration point: given a real (in-memory, for tests)
+SQLite DB and a target repo, `runPollTick()` fetches open PRs, upserts
+and decides which need review, processes the review queue serially, and
+records poll success/failure in `config`. `gh`, `repoCache`, and
+`reviewRunner` are mocked in this test; the DB layer is exercised for
+real against an in-memory instance so the whole data-flow path is
+verified end-to-end except for the actual external processes.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/lib/poller.test.ts`:
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createTestDb } from '../db/client';
+import { getByNumber, getOpenPrs } from '../db/pullRequests';
+import { getConfig } from '../db/config';
+import { getFindingsByPrId } from '../db/findings';
+
+const fetchOpenPrsMock = vi.fn();
+vi.mock('./gh', () => ({ fetchOpenPrs: (...args: unknown[]) => fetchOpenPrsMock(...args) }));
+
+const ensureBareRepoMock = vi.fn().mockResolvedValue(undefined);
+const addOrUpdateWorktreeMock = vi.fn().mockResolvedValue('/tmp/worktrees/pr-1');
+vi.mock('./repoCache', () => ({
+  ensureBareRepo: (...args: unknown[]) => ensureBareRepoMock(...args),
+  addOrUpdateWorktree: (...args: unknown[]) => addOrUpdateWorktreeMock(...args),
+}));
+
+const runReviewMock = vi.fn();
+vi.mock('./reviewRunner', () => ({ runReview: (...args: unknown[]) => runReviewMock(...args) }));
+
+const { runPollTick } = await import('./poller');
+
+const basePrFromGh = {
+  number: 1,
+  title: 'Add feature',
+  author: 'alice',
+  headRefName: 'feat/x',
+  baseRefName: 'main',
+  headRefOid: 'sha1',
+  url: 'https://github.com/owner/name/pull/1',
+  isDraft: false,
+};
+
+describe('runPollTick', () => {
+  let db: ReturnType<typeof createTestDb>;
+
+  beforeEach(() => {
+    db = createTestDb();
+    fetchOpenPrsMock.mockReset();
+    ensureBareRepoMock.mockClear();
+    addOrUpdateWorktreeMock.mockClear();
+    runReviewMock.mockReset();
+  });
+
+  it('reviews a brand new PR end-to-end and records a successful review', async () => {
+    fetchOpenPrsMock.mockResolvedValue([basePrFromGh]);
+    runReviewMock.mockResolvedValue({
+      success: true,
+      output: `# Report\n\n\`\`\`json\n{"verdict": "approve", "findings": []}\n\`\`\`\n`,
+    });
+
+    await runPollTick(db, 'owner/name');
+
+    const row = getByNumber(db, 'owner/name', 1)!;
+    expect(row.review_status).toBe('done');
+    expect(row.verdict).toBe('approve');
+    expect(row.reviewed_head_sha).toBe('sha1');
+    expect(getConfig(db, 'last_poll_status')).toBe('ok');
+    expect(ensureBareRepoMock).toHaveBeenCalledWith('owner/name');
+    expect(addOrUpdateWorktreeMock).toHaveBeenCalledWith('owner/name', 1, 'sha1');
+  });
+
+  it('skips a draft PR entirely (tracked but never reviewed)', async () => {
+    fetchOpenPrsMock.mockResolvedValue([{ ...basePrFromGh, isDraft: true }]);
+
+    await runPollTick(db, 'owner/name');
+
+    const row = getByNumber(db, 'owner/name', 1)!;
+    expect(row.review_status).toBe('pending'); // insert default, never actually run
+    expect(runReviewMock).not.toHaveBeenCalled();
+    expect(getOpenPrs(db, 'owner/name')).toEqual([]); // filtered out of the visible list
+  });
+
+  it('re-reviews an existing PR when head_sha changed, storing new findings and clearing old ones', async () => {
+    fetchOpenPrsMock.mockResolvedValueOnce([basePrFromGh]);
+    runReviewMock.mockResolvedValueOnce({
+      success: true,
+      output: `# R1\n\n\`\`\`json\n{"verdict": "needs_fix", "findings": [{"summary": "old finding", "severity": "HIGH"}]}\n\`\`\`\n`,
+    });
+    await runPollTick(db, 'owner/name');
+    const firstRow = getByNumber(db, 'owner/name', 1)!;
+    expect(getFindingsByPrId(db, firstRow.id)).toHaveLength(1);
+
+    fetchOpenPrsMock.mockResolvedValueOnce([{ ...basePrFromGh, headRefOid: 'sha2' }]);
+    runReviewMock.mockResolvedValueOnce({
+      success: true,
+      output: `# R2\n\n\`\`\`json\n{"verdict": "approve", "findings": []}\n\`\`\`\n`,
+    });
+    await runPollTick(db, 'owner/name');
+
+    const secondRow = getByNumber(db, 'owner/name', 1)!;
+    expect(secondRow.reviewed_head_sha).toBe('sha2');
+    expect(secondRow.verdict).toBe('approve');
+    expect(getFindingsByPrId(db, secondRow.id)).toHaveLength(0); // old finding replaced
+    expect(runReviewMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not re-review an unchanged PR on a second poll tick', async () => {
+    fetchOpenPrsMock.mockResolvedValue([basePrFromGh]);
+    runReviewMock.mockResolvedValue({
+      success: true,
+      output: `# R\n\n\`\`\`json\n{"verdict": "approve", "findings": []}\n\`\`\`\n`,
+    });
+
+    await runPollTick(db, 'owner/name');
+    await runPollTick(db, 'owner/name');
+
+    expect(runReviewMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks a PR failed when the review run fails, preserving no prior successful data to lose', async () => {
+    fetchOpenPrsMock.mockResolvedValue([basePrFromGh]);
+    runReviewMock.mockResolvedValue({
+      success: false,
+      output: '',
+      errorMessage: 'copilot timed out after 600000ms',
+    });
+
+    await runPollTick(db, 'owner/name');
+
+    const row = getByNumber(db, 'owner/name', 1)!;
+    expect(row.review_status).toBe('failed');
+    expect(row.error_message).toBe('copilot timed out after 600000ms');
+    expect(row.reviewed_head_sha).toBeNull();
+    expect(row.last_reviewed_at).toBeNull();
+  });
+
+  it('marks the poll itself failed and leaves existing data untouched when gh pr list throws', async () => {
+    fetchOpenPrsMock.mockResolvedValue([basePrFromGh]);
+    runReviewMock.mockResolvedValue({
+      success: true,
+      output: `# R\n\n\`\`\`json\n{"verdict": "approve", "findings": []}\n\`\`\`\n`,
+    });
+    await runPollTick(db, 'owner/name'); // establish a successful baseline
+
+    fetchOpenPrsMock.mockRejectedValueOnce(new Error('gh: authentication required'));
+    await runPollTick(db, 'owner/name');
+
+    expect(getConfig(db, 'last_poll_status')).toBe('error');
+    expect(getConfig(db, 'last_poll_error')).toBe('gh: authentication required');
+    const row = getByNumber(db, 'owner/name', 1)!;
+    expect(row.review_status).toBe('done'); // untouched by the failed poll
+  });
+
+  it('marks PRs absent from the gh result as closed', async () => {
+    fetchOpenPrsMock.mockResolvedValueOnce([basePrFromGh]);
+    runReviewMock.mockResolvedValue({
+      success: true,
+      output: `# R\n\n\`\`\`json\n{"verdict": "approve", "findings": []}\n\`\`\`\n`,
+    });
+    await runPollTick(db, 'owner/name');
+
+    fetchOpenPrsMock.mockResolvedValueOnce([]); // PR #1 merged/closed upstream
+    await runPollTick(db, 'owner/name');
+
+    expect(getByNumber(db, 'owner/name', 1)!.pr_state).toBe('closed');
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/lib/poller.test.ts`
+Expected: FAIL — `Cannot find module './poller'`.
+
+- [ ] **Step 3: Write `src/lib/poller.ts`**
+
+```typescript
+import type Database from 'better-sqlite3';
+import { fetchOpenPrs } from './gh';
+import { ensureBareRepo, addOrUpdateWorktree } from './repoCache';
+import { runReview } from './reviewRunner';
+import { buildReviewPrompt } from './reviewPrompt';
+import { parseReviewOutput } from './parseReviewOutput';
+import { decidePrAction } from './decision';
+import { getConfig, setConfig } from '../db/config';
+import {
+  upsertOpenPr,
+  markClosedExcept,
+  markPending,
+  markReviewing,
+  markDone,
+  markFailed,
+  getByNumber,
+  getPendingPrs,
+} from '../db/pullRequests';
+import { replaceFindings, type FindingInput } from '../db/findings';
+
+const REVIEW_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes, per spec
+
+export async function runPollTick(db: Database.Database, repo: string): Promise<void> {
+  let prs;
+  try {
+    prs = await fetchOpenPrs(repo);
+  } catch (err) {
+    setConfig(db, 'last_poll_status', 'error');
+    setConfig(db, 'last_poll_error', err instanceof Error ? err.message : String(err));
+    return; // this tick's upsert/close/enqueue step is skipped entirely
+  }
+
+  const keepPrNumbers: number[] = [];
+  for (const pr of prs) {
+    keepPrNumbers.push(pr.number);
+    const existing = getByNumber(db, repo, pr.number);
+    const previousHeadSha = existing?.head_sha ?? null;
+    const reviewStatus = existing?.review_status ?? null;
+
+    upsertOpenPr(db, {
+      repo,
+      prNumber: pr.number,
+      title: pr.title,
+      author: pr.author,
+      branch: pr.headRefName,
+      baseBranch: pr.baseRefName,
+      headSha: pr.headRefOid,
+      prUrl: pr.url,
+      isDraft: pr.isDraft,
+    });
+
+    // Brand new rows are already 'pending' from upsertOpenPr's INSERT
+    // default; only an *existing* tracked row needs to be explicitly
+    // flipped back to 'pending' here.
+    if (existing) {
+      const decision = decidePrAction({
+        isDraft: pr.isDraft,
+        previousHeadSha,
+        newHeadSha: pr.headRefOid,
+        reviewStatus,
+      });
+      if (decision === 'enqueue') {
+        markPending(db, existing.id);
+      }
+    }
+  }
+
+  markClosedExcept(db, repo, keepPrNumbers);
+  setConfig(db, 'last_poll_at', new Date().toISOString());
+  setConfig(db, 'last_poll_status', 'ok');
+  setConfig(db, 'last_poll_error', '');
+
+  await processQueue(db, repo);
+}
+
+async function processQueue(db: Database.Database, repo: string): Promise<void> {
+  // Re-read the queue before each item: this loop only ever runs within
+  // a single poll tick (or a single manual re-check, in Chunk 5), so no
+  // other writer can enqueue more work concurrently in-process.
+  for (const pr of getPendingPrs(db, repo)) {
+    await processOnePr(db, repo, pr.id, pr.pr_number, pr.title, pr.branch, pr.base_branch, pr.head_sha);
+  }
+}
+
+async function processOnePr(
+  db: Database.Database,
+  repo: string,
+  id: number,
+  prNumber: number,
+  title: string,
+  branch: string,
+  baseBranch: string,
+  headSha: string
+): Promise<void> {
+  markReviewing(db, id);
+
+  let worktreeDir: string;
+  try {
+    await ensureBareRepo(repo);
+    worktreeDir = await addOrUpdateWorktree(repo, prNumber, headSha);
+  } catch (err) {
+    markFailed(db, id, err instanceof Error ? err.message : String(err));
+    return;
+  }
+
+  const prompt = buildReviewPrompt({ repo, prNumber, title, branch, baseBranch });
+  const result = await runReview(worktreeDir, prompt, REVIEW_TIMEOUT_MS);
+
+  if (!result.success) {
+    markFailed(db, id, result.errorMessage ?? 'Review failed for an unknown reason');
+    return;
+  }
+
+  const parsed = parseReviewOutput(result.output);
+  const findingInputs: FindingInput[] = parsed.findings.map((f) => ({
+    file: f.file ?? '',
+    line: f.line ?? 0,
+    severity: f.severity,
+    summary: f.summary,
+    failureScenario: f.failureScenario ?? '',
+    evidence: f.evidence ?? '',
+    fixSuggestion: f.fixSuggestion ?? '',
+    codeSnippet: f.codeSnippet ?? '',
+  }));
+
+  replaceFindings(db, id, findingInputs);
+  markDone(db, id, {
+    verdict: parsed.verdict,
+    severityCritical: countSeverity(parsed.findings, 'CRITICAL'),
+    severityHigh: countSeverity(parsed.findings, 'HIGH'),
+    severityMedium: countSeverity(parsed.findings, 'MEDIUM'),
+    severityLow: countSeverity(parsed.findings, 'LOW'),
+    reviewedHeadSha: headSha,
+    rawReportMd: parsed.rawReportMd,
+  });
+}
+
+function countSeverity(findings: { severity: string }[], severity: string): number {
+  return findings.filter((f) => f.severity === severity).length;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/lib/poller.test.ts`
+Expected: PASS, 7 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/lib/poller.ts src/lib/poller.test.ts
+git commit -m "feat(lib): wire gh/decision/repoCache/reviewRunner into full poll tick orchestration"
+```
+
+---
+
+### Task 4.4: Startup `TARGET_REPO` validation
+
+**Files:**
+- Create: `src/lib/startupConfig.ts`
+- Test: `src/lib/startupConfig.test.ts`
+
+Per spec: if `TARGET_REPO` is unset or not a valid `owner/name` string at
+startup, the process must log a fatal error and exit immediately rather
+than start in a half-configured state. The validation itself is a pure
+function so it's fully unit-testable without touching `process.exit()`
+(that side effect lives in Task 4.5's `instrumentation.ts`).
+
+- [ ] **Step 1: Write the failing test**
+
+`src/lib/startupConfig.test.ts`:
+```typescript
+import { describe, it, expect } from 'vitest';
+import { parseTargetRepo } from './startupConfig';
+
+describe('parseTargetRepo', () => {
+  it('accepts a well-formed owner/name value', () => {
+    expect(parseTargetRepo('octocat/hello-world')).toEqual({ ok: true, repo: 'octocat/hello-world' });
+  });
+
+  it('rejects an unset value', () => {
+    const result = parseTargetRepo(undefined);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/not set/i);
+  });
+
+  it('rejects an empty string', () => {
+    const result = parseTargetRepo('');
+    expect(result.ok).toBe(false);
+  });
+
+  it('rejects a value with no slash', () => {
+    const result = parseTargetRepo('justaname');
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/owner\/name/i);
+  });
+
+  it('rejects a value with more than one slash', () => {
+    const result = parseTargetRepo('owner/name/extra');
+    expect(result.ok).toBe(false);
+  });
+
+  it('rejects a value containing whitespace', () => {
+    const result = parseTargetRepo('owner/name with space');
+    expect(result.ok).toBe(false);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/lib/startupConfig.test.ts`
+Expected: FAIL — `Cannot find module './startupConfig'`.
+
+- [ ] **Step 3: Write `src/lib/startupConfig.ts`**
+
+```typescript
+export interface TargetRepoResult {
+  ok: boolean;
+  repo?: string;
+  error?: string;
+}
+
+const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+export function parseTargetRepo(value: string | undefined): TargetRepoResult {
+  if (!value) {
+    return { ok: false, error: 'TARGET_REPO environment variable is not set' };
+  }
+  if (!REPO_PATTERN.test(value)) {
+    return {
+      ok: false,
+      error: `TARGET_REPO "${value}" is not a valid "owner/name" repo identifier`,
+    };
+  }
+  return { ok: true, repo: value };
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/lib/startupConfig.test.ts`
+Expected: PASS, 6 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/lib/startupConfig.ts src/lib/startupConfig.test.ts
+git commit -m "feat(lib): validate TARGET_REPO at startup"
+```
+
+---
+
+### Task 4.5: Cron registration via `instrumentation.ts`
+
+**Files:**
+- Create: `src/instrumentation.ts`
+- Test: `src/instrumentation.test.ts`
+
+Next.js automatically calls `register()` from `src/instrumentation.ts`
+once per server process — but can invoke it more than once in dev mode
+across hot reloads, so it must guard itself with a `globalThis`-keyed
+flag (same pattern as Task 4.2's poll-tick mutex). On successful startup
+it validates `TARGET_REPO`, persists it to `config.target_repo`, resets
+any rows stuck `pending`/`reviewing` from a previous process, registers
+the 5-minute cron job, and kicks off one immediate poll tick (rather than
+waiting a full 5 minutes for the first result after starting the app).
+
+- [ ] **Step 1: Write the failing test**
+
+`src/instrumentation.test.ts`:
+```typescript
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+const scheduleMock = vi.fn();
+vi.mock('node-cron', () => ({ default: { schedule: (...args: unknown[]) => scheduleMock(...args) } }));
+
+const dbStub = { __fake: 'db' };
+const getDbMock = vi.fn(() => dbStub);
+vi.mock('./db/client', () => ({ getDb: (...args: unknown[]) => getDbMock(...args) }));
+
+const setConfigMock = vi.fn();
+vi.mock('./db/config', () => ({ setConfig: (...args: unknown[]) => setConfigMock(...args) }));
+
+const resetStuckReviewsMock = vi.fn();
+vi.mock('./db/pullRequests', () => ({
+  resetStuckReviews: (...args: unknown[]) => resetStuckReviewsMock(...args),
+}));
+
+const withPollLockMock = vi.fn((fn: () => unknown) => fn());
+vi.mock('./lib/queue', () => ({ withPollLock: (...args: unknown[]) => withPollLockMock(...args) }));
+
+const runPollTickMock = vi.fn().mockResolvedValue(undefined);
+vi.mock('./lib/poller', () => ({ runPollTick: (...args: unknown[]) => runPollTickMock(...args) }));
+
+describe('instrumentation register()', () => {
+  const originalEnv = process.env.TARGET_REPO;
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.resetModules();
+    scheduleMock.mockClear();
+    getDbMock.mockClear();
+    setConfigMock.mockClear();
+    resetStuckReviewsMock.mockClear();
+    withPollLockMock.mockClear();
+    runPollTickMock.mockClear();
+    (globalThis as any).__prDashboardCronRegistered = undefined;
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code}) called`);
+    }) as never);
+  });
+
+  afterEach(() => {
+    process.env.TARGET_REPO = originalEnv;
+    exitSpy.mockRestore();
+  });
+
+  it('validates TARGET_REPO, resets stuck reviews, schedules cron, and polls once immediately', async () => {
+    process.env.TARGET_REPO = 'owner/name';
+    const { register } = await import('./instrumentation');
+
+    await register();
+
+    expect(setConfigMock).toHaveBeenCalledWith(dbStub, 'target_repo', 'owner/name');
+    expect(resetStuckReviewsMock).toHaveBeenCalledWith(dbStub);
+    expect(scheduleMock).toHaveBeenCalledWith('*/5 * * * *', expect.any(Function));
+    expect(withPollLockMock).toHaveBeenCalledTimes(1); // immediate startup poll
+    expect(runPollTickMock).toHaveBeenCalledWith(dbStub, 'owner/name');
+  });
+
+  it('is a no-op on a second call in the same process (dev hot-reload guard)', async () => {
+    process.env.TARGET_REPO = 'owner/name';
+    const { register } = await import('./instrumentation');
+
+    await register();
+    await register();
+
+    expect(scheduleMock).toHaveBeenCalledTimes(1);
+    expect(withPollLockMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs a fatal error and exits when TARGET_REPO is missing', async () => {
+    delete process.env.TARGET_REPO;
+    const { register } = await import('./instrumentation');
+
+    await expect(register()).rejects.toThrow('process.exit(1) called');
+
+    expect(scheduleMock).not.toHaveBeenCalled();
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/instrumentation.test.ts`
+Expected: FAIL — `Cannot find module './instrumentation'`.
+
+- [ ] **Step 3: Write `src/instrumentation.ts`**
+
+```typescript
+import cron from 'node-cron';
+import { getDb } from './db/client';
+import { setConfig } from './db/config';
+import { resetStuckReviews } from './db/pullRequests';
+import { parseTargetRepo } from './lib/startupConfig';
+import { withPollLock } from './lib/queue';
+import { runPollTick } from './lib/poller';
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __prDashboardCronRegistered: boolean | undefined;
+}
+
+export async function register(): Promise<void> {
+  // Next.js can call register() more than once per process (e.g. across
+  // dev-mode hot reloads); a plain module-level flag would be reset by a
+  // module reload, so this must be keyed off globalThis to survive it.
+  if (globalThis.__prDashboardCronRegistered) return;
+  globalThis.__prDashboardCronRegistered = true;
+
+  const result = parseTargetRepo(process.env.TARGET_REPO);
+  if (!result.ok) {
+    // eslint-disable-next-line no-console
+    console.error(`FATAL: ${result.error}`);
+    process.exit(1);
+    return;
+  }
+  const repo = result.repo as string;
+
+  const db = getDb();
+  setConfig(db, 'target_repo', repo);
+  // Any row left pending/reviewing from a previous process would
+  // otherwise be permanently stuck against the single-flight rule.
+  resetStuckReviews(db);
+
+  cron.schedule('*/5 * * * *', () => {
+    void withPollLock(() => runPollTick(db, repo));
+  });
+
+  // Also poll immediately on startup, rather than waiting a full 5
+  // minutes for the first result after the app comes up.
+  await withPollLock(() => runPollTick(db, repo));
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/instrumentation.test.ts`
+Expected: PASS, 3 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/instrumentation.ts src/instrumentation.test.ts
+git commit -m "feat: register 5-minute cron poll via instrumentation.ts with dev-reload guard"
+```
+
+---
+
+### Task 4.6: Run full test suite for Chunk 4
+
+- [ ] **Step 1: Run the whole suite**
+
+Run: `npm run test`
+Expected: all Chunk 1–4 test files pass (client: 2, config: 3,
+pullRequests: 12, findings: 3, decision: 9, gh: 3, parseReviewOutput: 7,
+reviewPrompt: 1, repoCache: 6, reviewRunner: 4, queue: 4, poller: 7,
+startupConfig: 6, instrumentation: 3 — 70 tests total).
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add -A
+git commit -m "test: verify chunk 4 poller orchestration and cron scheduling passes as a whole" --allow-empty
 ```
 
 ---
