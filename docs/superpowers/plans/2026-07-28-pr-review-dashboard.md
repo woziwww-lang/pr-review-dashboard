@@ -866,6 +866,29 @@ describe('findings repository', () => {
     db.prepare('DELETE FROM pull_requests WHERE id = ?').run(prId);
     expect(getFindingsByPrId(db, prId)).toHaveLength(0);
   });
+
+  it('returns camelCase fields, not raw snake_case DB column names', () => {
+    replaceFindings(db, prId, [
+      {
+        file: 'a.ts',
+        line: 1,
+        severity: 'HIGH',
+        summary: 'x',
+        failureScenario: 'scenario text',
+        evidence: 'evidence text',
+        fixSuggestion: 'fix text',
+        codeSnippet: 'snippet text',
+      },
+    ]);
+    const [row] = getFindingsByPrId(db, prId);
+    // A naive `SELECT *` would return snake_case columns (failure_scenario,
+    // fix_suggestion, code_snippet) cast to this camelCase interface,
+    // silently leaving these fields `undefined` at runtime even though
+    // TypeScript wouldn't catch it - this test guards against that.
+    expect(row.failureScenario).toBe('scenario text');
+    expect(row.fixSuggestion).toBe('fix text');
+    expect(row.codeSnippet).toBe('snippet text');
+  });
 });
 ```
 
@@ -915,8 +938,20 @@ export function replaceFindings(
 }
 
 export function getFindingsByPrId(db: Database.Database, pullRequestId: number): FindingRow[] {
+  // Explicit column aliasing, not `SELECT *`: the `findings` table's
+  // columns are snake_case (failure_scenario, fix_suggestion,
+  // code_snippet) but `FindingRow` is camelCase to match `FindingInput`.
+  // `SELECT *` would silently produce rows with `undefined` camelCase
+  // fields at runtime despite the `as FindingRow` cast type-checking fine.
   return db
-    .prepare('SELECT * FROM findings WHERE pull_request_id = ? ORDER BY severity, line')
+    .prepare(
+      `SELECT id, pull_request_id, file, line, severity, summary,
+              failure_scenario AS failureScenario,
+              evidence,
+              fix_suggestion AS fixSuggestion,
+              code_snippet AS codeSnippet
+       FROM findings WHERE pull_request_id = ? ORDER BY severity, line`
+    )
     .all(pullRequestId) as FindingRow[];
 }
 ```
@@ -924,7 +959,7 @@ export function getFindingsByPrId(db: Database.Database, pullRequestId: number):
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `npm run test -- src/db/findings.test.ts`
-Expected: PASS, 3 tests.
+Expected: PASS, 4 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1690,8 +1725,8 @@ git commit -m "feat(lib): build the headless review prompt"
 
 Run: `npm run test`
 Expected: all Chunk 1 and Chunk 2 test files pass (client: 2, config: 3,
-pullRequests: 11, findings: 3, decision: 9, gh: 3, parseReviewOutput: 7,
-reviewPrompt: 1 — 39 tests total).
+pullRequests: 11, findings: 4, decision: 9, gh: 3, parseReviewOutput: 7,
+reviewPrompt: 1 — 40 tests total).
 
 - [ ] **Step 2: Commit**
 
@@ -2106,7 +2141,7 @@ git commit -m "feat(lib): spawn copilot -p headless with a timeout"
 Run: `npm run test`
 Expected: all Chunk 1, 2, and 3 test files pass (client: 2, config: 3,
 pullRequests: 11, findings: 3, decision: 9, gh: 3, parseReviewOutput: 7,
-reviewPrompt: 1, repoCache: 6, reviewRunner: 4 — 49 tests total).
+reviewPrompt: 1, repoCache: 6, reviewRunner: 4 — 50 tests total).
 
 - [ ] **Step 2: Commit**
 
@@ -2932,7 +2967,7 @@ Run: `npm run test`
 Expected: all Chunk 1–4 test files pass (client: 2, config: 3,
 pullRequests: 12, findings: 3, decision: 9, gh: 3, parseReviewOutput: 7,
 reviewPrompt: 1, repoCache: 6, reviewRunner: 4, queue: 4, poller: 7,
-startupConfig: 6, instrumentation: 3 — 70 tests total).
+startupConfig: 6, instrumentation: 3 — 71 tests total).
 
 - [ ] **Step 2: Commit**
 
