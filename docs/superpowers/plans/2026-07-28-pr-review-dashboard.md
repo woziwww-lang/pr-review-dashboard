@@ -945,3 +945,1171 @@ Expected: All db tests pass (client, config, pullRequests, findings).
 git add -A
 git commit -m "test: verify chunk 1 db layer passes as a whole" --allow-empty
 ```
+
+## Chunk 2: `gh` integration + pure decision/parsing logic
+
+This chunk adds the pieces needed to decide which tracked PRs need a
+review and to prepare/interpret a review run, without touching git
+worktrees or spawning `copilot` yet (that's Chunk 3): the pure
+enqueue-vs-skip decision logic, the `gh pr list` wrapper, the trailing-
+JSON-block parser for copilot's output, and the prompt builder. The `gh`
+call here only reads PR metadata — it never mutates anything on GitHub.
+
+### Task 2.1: Pure decision logic for enqueue-vs-skip
+
+**Files:**
+- Create: `src/lib/decision.ts`
+- Test: `src/lib/decision.test.ts`
+
+The poller (Chunk 3) will call `decidePrAction()` once per already-tracked
+PR row, comparing the row's `head_sha` *as it was before this poll tick's
+upsert* against the freshly-fetched `head_sha` from `gh pr list`. This
+must NOT be confused with `reviewed_head_sha` (which only updates on a
+*successful* review): a PR whose first-ever review attempt failed has
+`review_status='failed'` and `reviewed_head_sha=NULL` forever, but its
+`head_sha` doesn't change just because the attempt failed — comparing
+against the previous `head_sha` (not `reviewed_head_sha`) is what makes a
+failed PR with no new commits correctly stay terminal (skip) instead of
+being retried on every single poll tick.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/lib/decision.test.ts`:
+```typescript
+import { describe, it, expect } from 'vitest';
+import { decidePrAction, type DecisionInput } from './decision';
+
+function input(overrides: Partial<DecisionInput>): DecisionInput {
+  return {
+    isDraft: false,
+    previousHeadSha: 'sha1',
+    newHeadSha: 'sha1',
+    reviewStatus: 'done',
+    ...overrides,
+  };
+}
+
+describe('decidePrAction', () => {
+  it('enqueues a brand new row (reviewStatus is null)', () => {
+    expect(
+      decidePrAction(input({ reviewStatus: null, previousHeadSha: null, newHeadSha: 'sha1' }))
+    ).toBe('enqueue');
+  });
+
+  it('skips a brand new draft row', () => {
+    expect(
+      decidePrAction(input({ reviewStatus: null, previousHeadSha: null, isDraft: true }))
+    ).toBe('skip');
+  });
+
+  it('skips any draft regardless of head_sha change', () => {
+    expect(
+      decidePrAction(input({ isDraft: true, previousHeadSha: 'sha1', newHeadSha: 'sha2' }))
+    ).toBe('skip');
+  });
+
+  it('skips a row already pending (single-flight)', () => {
+    expect(
+      decidePrAction(input({ reviewStatus: 'pending', previousHeadSha: 'sha1', newHeadSha: 'sha2' }))
+    ).toBe('skip');
+  });
+
+  it('skips a row already reviewing (single-flight)', () => {
+    expect(
+      decidePrAction(input({ reviewStatus: 'reviewing', previousHeadSha: 'sha1', newHeadSha: 'sha2' }))
+    ).toBe('skip');
+  });
+
+  it('skips a done row when head_sha is unchanged', () => {
+    expect(
+      decidePrAction(input({ reviewStatus: 'done', previousHeadSha: 'sha1', newHeadSha: 'sha1' }))
+    ).toBe('skip');
+  });
+
+  it('enqueues a done row when head_sha changed', () => {
+    expect(
+      decidePrAction(input({ reviewStatus: 'done', previousHeadSha: 'sha1', newHeadSha: 'sha2' }))
+    ).toBe('enqueue');
+  });
+
+  it('skips a failed row when head_sha is unchanged (terminal, no auto-retry)', () => {
+    expect(
+      decidePrAction(input({ reviewStatus: 'failed', previousHeadSha: 'sha1', newHeadSha: 'sha1' }))
+    ).toBe('skip');
+  });
+
+  it('enqueues a failed row when head_sha changed', () => {
+    expect(
+      decidePrAction(input({ reviewStatus: 'failed', previousHeadSha: 'sha1', newHeadSha: 'sha2' }))
+    ).toBe('enqueue');
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/lib/decision.test.ts`
+Expected: FAIL — `Cannot find module './decision'`.
+
+- [ ] **Step 3: Write `src/lib/decision.ts`**
+
+```typescript
+export interface DecisionInput {
+  isDraft: boolean;
+  /** This PR's head_sha as stored before this poll tick's upsert; null for a brand new row. */
+  previousHeadSha: string | null;
+  /** head_sha just fetched from `gh pr list` for this poll tick. */
+  newHeadSha: string;
+  /** null means this row does not exist yet (about to be INSERTed). */
+  reviewStatus: 'pending' | 'reviewing' | 'done' | 'failed' | null;
+}
+
+export type Decision = 'enqueue' | 'skip';
+
+export function decidePrAction(input: DecisionInput): Decision {
+  if (input.isDraft) return 'skip'; // drafts are tracked but never reviewed
+
+  if (input.reviewStatus === null) return 'enqueue'; // brand new PR
+
+  // Single-flight: never re-enqueue work that's already in progress.
+  if (input.reviewStatus === 'pending' || input.reviewStatus === 'reviewing') {
+    return 'skip';
+  }
+
+  // reviewStatus is 'done' or 'failed' — both are terminal states until
+  // the commit actually changes, or a manual re-check/retry bypasses
+  // this function entirely (see Chunk 3 poller).
+  if (input.previousHeadSha !== input.newHeadSha) return 'enqueue';
+  return 'skip';
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/lib/decision.test.ts`
+Expected: PASS, 9 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/lib/decision.ts src/lib/decision.test.ts
+git commit -m "feat(lib): add pure enqueue-vs-skip decision logic"
+```
+
+---
+
+### Task 2.2: `markPending()` on the pull_requests repository
+
+**Files:**
+- Modify: `src/db/pullRequests.ts`
+- Modify: `src/db/pullRequests.test.ts`
+
+When `decidePrAction()` returns `'enqueue'` for an *already-tracked* row
+(brand new rows are already `'pending'` from `upsertOpenPr()`'s INSERT
+default), the poller needs a setter to flip that row back to `'pending'`
+and clear any stale failure banner, without touching the previous
+successful review data (`raw_report_md`, findings, `verdict`,
+`reviewed_head_sha`, `last_reviewed_at` all stay as-is until the new
+review completes).
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `src/db/pullRequests.test.ts` (import `markPending` alongside the
+existing imports at the top of the file):
+
+```typescript
+  it('markPending resets status to pending and clears error, preserving prior review data', () => {
+    upsertOpenPr(db, basePr);
+    const row = getByNumber(db, 'owner/name', 1)!;
+    markDone(db, row.id, {
+      verdict: 'approve',
+      severityCritical: 0,
+      severityHigh: 0,
+      severityMedium: 0,
+      severityLow: 0,
+      reviewedHeadSha: 'sha1',
+      rawReportMd: '# ok',
+    });
+    markFailed(db, row.id, 'transient error');
+
+    markPending(db, row.id);
+
+    const pending = getByNumber(db, 'owner/name', 1)!;
+    expect(pending.review_status).toBe('pending');
+    expect(pending.error_message).toBeNull();
+    expect(pending.verdict).toBe('approve'); // preserved until new review completes
+    expect(pending.reviewed_head_sha).toBe('sha1'); // preserved
+    expect(pending.raw_report_md).toBe('# ok'); // preserved
+  });
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/db/pullRequests.test.ts`
+Expected: FAIL — `markPending is not a function` / `Cannot find export`.
+
+- [ ] **Step 3: Add `markPending()` to `src/db/pullRequests.ts`**
+
+Add this export alongside the existing `markReviewing`/`markDone`/`markFailed`:
+
+```typescript
+export function markPending(db: Database.Database, id: number): void {
+  db.prepare(
+    `UPDATE pull_requests SET
+       review_status = 'pending',
+       error_message = NULL
+     WHERE id = @id`
+  ).run({ id });
+}
+```
+
+Also add `markPending` to the `import { ... } from './pullRequests'` list
+at the top of `src/db/pullRequests.test.ts`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/db/pullRequests.test.ts`
+Expected: PASS, 11 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/db/pullRequests.ts src/db/pullRequests.test.ts
+git commit -m "feat(db): add markPending to re-enqueue a tracked PR for review"
+```
+
+---
+
+### Task 2.3: `gh pr list` wrapper
+
+**Files:**
+- Create: `src/lib/gh.ts`
+- Test: `src/lib/gh.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+`src/lib/gh.test.ts`:
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const execFileMock = vi.fn();
+vi.mock('node:child_process', () => ({
+  execFile: (...args: unknown[]) => execFileMock(...args),
+}));
+
+const { fetchOpenPrs } = await import('./gh');
+
+describe('fetchOpenPrs', () => {
+  beforeEach(() => {
+    execFileMock.mockReset();
+  });
+
+  it('parses gh pr list JSON output into a typed PR list', async () => {
+    const fixture = [
+      {
+        number: 1,
+        title: 'Add feature',
+        author: { login: 'alice' },
+        headRefName: 'feat/x',
+        baseRefName: 'main',
+        headRefOid: 'sha1',
+        url: 'https://github.com/o/r/pull/1',
+        isDraft: false,
+      },
+    ];
+    execFileMock.mockImplementation((_cmd, _args, cb) => cb(null, JSON.stringify(fixture), ''));
+
+    const result = await fetchOpenPrs('o/r');
+
+    expect(result).toEqual([
+      {
+        number: 1,
+        title: 'Add feature',
+        author: 'alice',
+        headRefName: 'feat/x',
+        baseRefName: 'main',
+        headRefOid: 'sha1',
+        url: 'https://github.com/o/r/pull/1',
+        isDraft: false,
+      },
+    ]);
+    expect(execFileMock).toHaveBeenCalledWith(
+      'gh',
+      [
+        'pr', 'list',
+        '--repo', 'o/r',
+        '--state', 'open',
+        '--json', 'number,title,author,headRefName,baseRefName,headRefOid,url,isDraft',
+      ],
+      expect.any(Function)
+    );
+  });
+
+  it('returns an empty array when there are no open PRs', async () => {
+    execFileMock.mockImplementation((_cmd, _args, cb) => cb(null, '[]', ''));
+    const result = await fetchOpenPrs('o/r');
+    expect(result).toEqual([]);
+  });
+
+  it('rejects when gh exits non-zero (e.g. auth/network error)', async () => {
+    execFileMock.mockImplementation((_cmd, _args, cb) => cb(new Error('gh: command not found'), '', ''));
+    await expect(fetchOpenPrs('o/r')).rejects.toThrow('gh: command not found');
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/lib/gh.test.ts`
+Expected: FAIL — `Cannot find module './gh'`.
+
+- [ ] **Step 3: Write `src/lib/gh.ts`**
+
+```typescript
+import { execFile } from 'node:child_process';
+
+export interface GhPrListItem {
+  number: number;
+  title: string;
+  author: string;
+  headRefName: string;
+  baseRefName: string;
+  headRefOid: string;
+  url: string;
+  isDraft: boolean;
+}
+
+interface RawGhPr {
+  number: number;
+  title: string;
+  author: { login: string };
+  headRefName: string;
+  baseRefName: string;
+  headRefOid: string;
+  url: string;
+  isDraft: boolean;
+}
+
+// A hand-written Promise wrapper rather than `util.promisify(execFile)`:
+// promisify's multi-value (stdout, stderr) support for execFile relies on
+// Node internally tagging the real `execFile` with the
+// `util.promisify.custom` symbol. A plain callback-style mock (as used in
+// tests) doesn't carry that symbol, so `promisify` would silently fall
+// back to resolving with only the raw stdout *string* instead of
+// `{ stdout, stderr }` — breaking both real usage assumptions and test
+// mockability. This wrapper works identically against the real
+// `execFile` and against a simple `(cmd, args, callback) => ...` mock.
+function execFileAsync(cmd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, (error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve({ stdout: stdout.toString(), stderr: stderr.toString() });
+    });
+  });
+}
+
+// Read-only against the remote: `gh pr list` only reads PR metadata, it
+// never mutates anything on GitHub.
+export async function fetchOpenPrs(repo: string): Promise<GhPrListItem[]> {
+  const { stdout } = await execFileAsync('gh', [
+    'pr', 'list',
+    '--repo', repo,
+    '--state', 'open',
+    '--json', 'number,title,author,headRefName,baseRefName,headRefOid,url,isDraft',
+  ]);
+  const raw = JSON.parse(stdout) as RawGhPr[];
+  return raw.map((r) => ({
+    number: r.number,
+    title: r.title,
+    author: r.author.login,
+    headRefName: r.headRefName,
+    baseRefName: r.baseRefName,
+    headRefOid: r.headRefOid,
+    url: r.url,
+    isDraft: r.isDraft,
+  }));
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/lib/gh.test.ts`
+Expected: PASS, 3 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/lib/gh.ts src/lib/gh.test.ts
+git commit -m "feat(lib): add gh pr list wrapper"
+```
+
+---
+
+### Task 2.4: Parse copilot's review output
+
+**Files:**
+- Create: `src/lib/parseReviewOutput.ts`
+- Test: `src/lib/parseReviewOutput.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+`src/lib/parseReviewOutput.test.ts`:
+```typescript
+import { describe, it, expect } from 'vitest';
+import { parseReviewOutput } from './parseReviewOutput';
+
+const wellFormed = `# Code Review
+
+## Executive Summary
+Some markdown report text.
+
+\`\`\`json
+{
+  "verdict": "needs_fix",
+  "findings": [
+    {
+      "file": "src/auth.ts",
+      "line": 42,
+      "severity": "HIGH",
+      "summary": "Missing input validation",
+      "failureScenario": "Malformed input crashes the server",
+      "evidence": "line 42 reads req.body.token without checking type",
+      "fixSuggestion": "Validate token is a non-empty string before use",
+      "codeSnippet": "if (typeof token !== 'string') throw new Error('invalid token');"
+    }
+  ]
+}
+\`\`\`
+`;
+
+describe('parseReviewOutput', () => {
+  it('extracts verdict and findings from a well-formed trailing JSON block', () => {
+    const result = parseReviewOutput(wellFormed);
+    expect(result.verdict).toBe('needs_fix');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({
+      file: 'src/auth.ts',
+      line: 42,
+      severity: 'HIGH',
+      summary: 'Missing input validation',
+    });
+    expect(result.rawReportMd).toBe(wellFormed);
+  });
+
+  it('falls back to needs_review with no findings when the JSON block is missing', () => {
+    const noJson = '# Code Review\n\nJust markdown, no fenced block.';
+    const result = parseReviewOutput(noJson);
+    expect(result.verdict).toBe('needs_review');
+    expect(result.findings).toEqual([]);
+    expect(result.rawReportMd).toBe(noJson);
+  });
+
+  it('falls back to needs_review with no findings when the JSON block is malformed', () => {
+    const badJson = '# Report\n\n```json\n{ this is not valid json \n```\n';
+    const result = parseReviewOutput(badJson);
+    expect(result.verdict).toBe('needs_review');
+    expect(result.findings).toEqual([]);
+    expect(result.rawReportMd).toBe(badJson);
+  });
+
+  it('falls back to needs_review when JSON is valid but has an unexpected shape', () => {
+    const wrongShape = '# Report\n\n```json\n{"verdict": "bogus", "findings": "not-an-array"}\n```\n';
+    const result = parseReviewOutput(wrongShape);
+    expect(result.verdict).toBe('needs_review');
+    expect(result.findings).toEqual([]);
+  });
+
+  it('defaults missing optional finding fields to null rather than throwing', () => {
+    const sparse = '# Report\n\n```json\n{"verdict": "approve", "findings": [{"summary": "ok", "severity": "LOW"}]}\n```\n';
+    const result = parseReviewOutput(sparse);
+    expect(result.verdict).toBe('approve');
+    expect(result.findings[0]).toEqual({
+      file: null,
+      line: null,
+      severity: 'LOW',
+      summary: 'ok',
+      failureScenario: null,
+      evidence: null,
+      fixSuggestion: null,
+      codeSnippet: null,
+    });
+  });
+
+  it('drops individual malformed finding entries but keeps well-formed ones from the same block', () => {
+    const mixed = `# Report
+
+\`\`\`json
+{
+  "verdict": "needs_fix",
+  "findings": [
+    { "summary": "missing severity entirely" },
+    { "summary": "bad severity value", "severity": "SUPER_BAD" },
+    { "severity": "HIGH" },
+    null,
+    "not an object either",
+    { "summary": "valid finding", "severity": "HIGH", "file": "a.ts", "line": 1 }
+  ]
+}
+\`\`\`
+`;
+    const result = parseReviewOutput(mixed);
+    expect(result.verdict).toBe('needs_fix');
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({ summary: 'valid finding', severity: 'HIGH' });
+  });
+
+  it('does not parse a ```json block that is not the trailing content', () => {
+    const midText = '# Report\n\n```json\n{"verdict": "approve", "findings": []}\n```\n\nSome trailing prose after the block.';
+    const result = parseReviewOutput(midText);
+    expect(result.verdict).toBe('needs_review');
+    expect(result.findings).toEqual([]);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/lib/parseReviewOutput.test.ts`
+Expected: FAIL — `Cannot find module './parseReviewOutput'`.
+
+- [ ] **Step 3: Write `src/lib/parseReviewOutput.ts`**
+
+```typescript
+export type Verdict = 'approve' | 'needs_fix' | 'needs_review';
+export type Severity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+
+export interface ParsedFinding {
+  file: string | null;
+  line: number | null;
+  severity: Severity;
+  summary: string;
+  failureScenario: string | null;
+  evidence: string | null;
+  fixSuggestion: string | null;
+  codeSnippet: string | null;
+}
+
+export interface ParsedReview {
+  verdict: Verdict;
+  findings: ParsedFinding[];
+  rawReportMd: string;
+}
+
+const VALID_VERDICTS: Verdict[] = ['approve', 'needs_fix', 'needs_review'];
+const VALID_SEVERITIES: Severity[] = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
+// Matches a fenced ```json ... ``` block anchored at the very end of the
+// output (trailing whitespace allowed), per the prompt contract in
+// reviewPrompt.ts.
+const TRAILING_JSON_BLOCK = /```json\s*([\s\S]*?)\s*```\s*$/;
+
+function emptyResult(rawReportMd: string): ParsedReview {
+  return { verdict: 'needs_review', findings: [], rawReportMd };
+}
+
+export function parseReviewOutput(rawOutput: string): ParsedReview {
+  const match = rawOutput.match(TRAILING_JSON_BLOCK);
+  if (!match) return emptyResult(rawOutput);
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(match[1]);
+  } catch {
+    return emptyResult(rawOutput);
+  }
+
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    !VALID_VERDICTS.includes((parsed as { verdict?: string }).verdict as Verdict) ||
+    !Array.isArray((parsed as { findings?: unknown }).findings)
+  ) {
+    return emptyResult(rawOutput);
+  }
+
+  const { verdict, findings: rawFindings } = parsed as {
+    verdict: Verdict;
+    findings: Array<Record<string, unknown>>;
+  };
+
+  // A finding entry must have at least a non-empty `summary` and a valid
+  // `severity` to be usable — rather than silently coercing bad data
+  // (e.g. defaulting an invalid severity to LOW), entries missing these
+  // required fields are dropped so we don't persist misleading findings
+  // or skew severity counts. This only drops the individual malformed
+  // entry; the rest of a well-formed block (and its verdict) still apply.
+  const findings: ParsedFinding[] = rawFindings
+    .filter(
+      (f) =>
+        typeof f === 'object' &&
+        f !== null &&
+        typeof f.summary === 'string' &&
+        f.summary.length > 0 &&
+        VALID_SEVERITIES.includes(f.severity as Severity)
+    )
+    .map((f) => ({
+      file: typeof f.file === 'string' ? f.file : null,
+      line: typeof f.line === 'number' ? f.line : null,
+      severity: f.severity as Severity,
+      summary: f.summary as string,
+      failureScenario: typeof f.failureScenario === 'string' ? f.failureScenario : null,
+      evidence: typeof f.evidence === 'string' ? f.evidence : null,
+      fixSuggestion: typeof f.fixSuggestion === 'string' ? f.fixSuggestion : null,
+      codeSnippet: typeof f.codeSnippet === 'string' ? f.codeSnippet : null,
+    }));
+
+  return { verdict, findings, rawReportMd: rawOutput };
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/lib/parseReviewOutput.test.ts`
+Expected: PASS, 7 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/lib/parseReviewOutput.ts src/lib/parseReviewOutput.test.ts
+git commit -m "feat(lib): parse copilot review output into structured findings"
+```
+
+---
+
+### Task 2.5: Build the review prompt
+
+**Files:**
+- Create: `src/lib/reviewPrompt.ts`
+- Test: `src/lib/reviewPrompt.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+`src/lib/reviewPrompt.test.ts`:
+```typescript
+import { describe, it, expect } from 'vitest';
+import { buildReviewPrompt } from './reviewPrompt';
+
+describe('buildReviewPrompt', () => {
+  it('includes PR identity, branch info, and the JSON contract', () => {
+    const prompt = buildReviewPrompt({
+      repo: 'owner/name',
+      prNumber: 42,
+      title: 'Add login form',
+      branch: 'feat/login',
+      baseBranch: 'main',
+    });
+
+    expect(prompt).toContain('owner/name');
+    expect(prompt).toContain('#42');
+    expect(prompt).toContain('Add login form');
+    expect(prompt).toContain('feat/login');
+    expect(prompt).toContain('main');
+    expect(prompt).toContain('local-advanced-code-review');
+    expect(prompt).toContain('```json');
+    expect(prompt).toContain('"verdict"');
+    expect(prompt).toContain('"findings"');
+    expect(prompt.toLowerCase()).toContain('do not push');
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/lib/reviewPrompt.test.ts`
+Expected: FAIL — `Cannot find module './reviewPrompt'`.
+
+- [ ] **Step 3: Write `src/lib/reviewPrompt.ts`**
+
+```typescript
+export interface ReviewPromptInput {
+  repo: string;
+  prNumber: number;
+  title: string;
+  branch: string;
+  baseBranch: string;
+}
+
+export function buildReviewPrompt(input: ReviewPromptInput): string {
+  return `You are reviewing pull request #${input.prNumber} "${input.title}" in ${input.repo}.
+Branch: ${input.branch} -> ${input.baseBranch}
+
+This working directory is a local, read-only git worktree checked out at
+this PR's head commit. Do not push, commit, or modify any remote branch —
+only read the code to produce a review.
+
+Invoke the local-advanced-code-review skill and perform its full review
+flow against the diff between ${input.baseBranch} and this branch.
+
+After the normal markdown report, append exactly one trailing fenced code
+block labeled \`\`\`json containing ONLY this JSON shape (no commentary
+after it, no markdown inside it):
+
+\`\`\`json
+{
+  "verdict": "approve" | "needs_fix" | "needs_review",
+  "findings": [
+    {
+      "file": "path/to/file",
+      "line": 123,
+      "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
+      "summary": "one-line description",
+      "failureScenario": "what goes wrong and when",
+      "evidence": "why you believe this, e.g. quoted code or trace",
+      "fixSuggestion": "concrete suggested fix",
+      "codeSnippet": "optional short snippet illustrating the fix"
+    }
+  ]
+}
+\`\`\`
+`;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/lib/reviewPrompt.test.ts`
+Expected: PASS, 1 test.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/lib/reviewPrompt.ts src/lib/reviewPrompt.test.ts
+git commit -m "feat(lib): build the headless review prompt"
+```
+
+---
+
+### Task 2.6: Run full test suite for Chunk 2
+
+- [ ] **Step 1: Run the whole suite**
+
+Run: `npm run test`
+Expected: all Chunk 1 and Chunk 2 test files pass (client: 2, config: 3,
+pullRequests: 11, findings: 3, decision: 9, gh: 3, parseReviewOutput: 7,
+reviewPrompt: 1 — 39 tests total).
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add -A
+git commit -m "test: verify chunk 2 decision/gh/parse/prompt layer passes as a whole" --allow-empty
+```
+
+---
+
+## Chunk 3: Repo cache + review execution
+
+This chunk adds the local git worktree management and the headless
+`copilot -p` process runner — the two remaining pieces needed before
+Chunk 4 can wire everything into the poller loop. As with Chunk 2, every
+git operation here is read-only against the remote (`clone --bare` and
+`fetch` only).
+
+### Task 3.1: Repo cache — bare clone, fetch, and per-PR worktrees
+
+**Files:**
+- Create: `src/lib/repoCache.ts`
+- Test: `src/lib/repoCache.test.ts`
+
+Layout (matches the spec): a single bare/mirror clone per repo at
+`~/.pr-review-dashboard/repos/<owner>__<name>/repo.git`, with one worktree
+per PR at `.../worktrees/pr-<number>`. Only `git clone --bare` and
+`git fetch` ever touch the remote; `git worktree add` operates purely
+locally against the bare repo.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/lib/repoCache.test.ts`:
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const execFileMock = vi.fn((_cmd, _args, cb) => cb(null, '', ''));
+vi.mock('node:child_process', () => ({
+  execFile: (...args: unknown[]) => execFileMock(...args),
+}));
+
+const existsSyncMock = vi.fn();
+const mkdirSyncMock = vi.fn();
+vi.mock('node:fs', () => ({
+  default: {
+    existsSync: (...args: unknown[]) => existsSyncMock(...args),
+    mkdirSync: (...args: unknown[]) => mkdirSyncMock(...args),
+  },
+}));
+
+const {
+  getBareRepoPath,
+  getWorktreePath,
+  ensureBareRepo,
+  addOrUpdateWorktree,
+} = await import('./repoCache');
+
+describe('repoCache paths', () => {
+  it('derives the bare repo path from owner/name, replacing the slash', () => {
+    expect(getBareRepoPath('owner/name')).toMatch(/owner__name[/\\]repo\.git$/);
+  });
+
+  it('derives a per-PR worktree path', () => {
+    expect(getWorktreePath('owner/name', 42)).toMatch(/worktrees[/\\]pr-42$/);
+  });
+});
+
+describe('ensureBareRepo', () => {
+  beforeEach(() => {
+    execFileMock.mockClear();
+    existsSyncMock.mockReset();
+    mkdirSyncMock.mockReset();
+  });
+
+  it('clones --bare when the repo does not exist locally yet', async () => {
+    existsSyncMock.mockReturnValue(false);
+
+    await ensureBareRepo('owner/name');
+
+    expect(execFileMock).toHaveBeenCalledWith(
+      'git',
+      expect.arrayContaining(['clone', '--bare']),
+      expect.any(Function)
+    );
+  });
+
+  it('fetches instead of cloning when the bare repo already exists', async () => {
+    existsSyncMock.mockReturnValue(true);
+
+    await ensureBareRepo('owner/name');
+
+    expect(execFileMock).toHaveBeenCalledWith(
+      'git',
+      expect.arrayContaining(['fetch']),
+      expect.any(Function)
+    );
+    expect(execFileMock).not.toHaveBeenCalledWith(
+      'git',
+      expect.arrayContaining(['clone']),
+      expect.any(Function)
+    );
+  });
+});
+
+describe('addOrUpdateWorktree', () => {
+  beforeEach(() => {
+    execFileMock.mockClear();
+    existsSyncMock.mockReset();
+    mkdirSyncMock.mockReset();
+  });
+
+  it('adds a fresh worktree when none exists for this PR yet', async () => {
+    existsSyncMock.mockReturnValue(false);
+
+    const dir = await addOrUpdateWorktree('owner/name', 42, 'sha1');
+
+    expect(dir).toMatch(/worktrees[/\\]pr-42$/);
+    const [, args] = execFileMock.mock.calls[0];
+    expect(args).toEqual(expect.arrayContaining(['worktree', 'add', '--detach', dir, 'sha1']));
+    expect(args).not.toContain('--force');
+  });
+
+  it('force re-points an existing worktree to the new head_sha', async () => {
+    existsSyncMock.mockReturnValue(true);
+
+    const dir = await addOrUpdateWorktree('owner/name', 42, 'sha2');
+
+    const [, args] = execFileMock.mock.calls[0];
+    expect(args).toEqual(
+      expect.arrayContaining(['worktree', 'add', '--force', '--detach', dir, 'sha2'])
+    );
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/lib/repoCache.test.ts`
+Expected: FAIL — `Cannot find module './repoCache'`.
+
+- [ ] **Step 3: Write `src/lib/repoCache.ts`**
+
+```typescript
+import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+// See gh.ts for why this is a hand-written wrapper rather than
+// `util.promisify(execFile)` (promisify's execFile-specific behavior
+// depends on a symbol real Node sets internally, which plain test mocks
+// don't carry).
+function execFileAsync(cmd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, (error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve({ stdout: stdout.toString(), stderr: stderr.toString() });
+    });
+  });
+}
+
+export function getReposRootDir(): string {
+  return (
+    process.env.PR_DASHBOARD_REPOS_DIR ??
+    path.join(os.homedir(), '.pr-review-dashboard', 'repos')
+  );
+}
+
+function repoDirName(repo: string): string {
+  return repo.replace('/', '__');
+}
+
+export function getBareRepoPath(repo: string): string {
+  return path.join(getReposRootDir(), repoDirName(repo), 'repo.git');
+}
+
+export function getWorktreePath(repo: string, prNumber: number): string {
+  return path.join(getReposRootDir(), repoDirName(repo), 'worktrees', `pr-${prNumber}`);
+}
+
+// Read-only against the remote: only `clone --bare` (first use) and
+// `fetch` (subsequent polls) are ever run against the remote. Nothing
+// here ever pushes or mutates a remote ref.
+export async function ensureBareRepo(repo: string): Promise<void> {
+  const bareDir = getBareRepoPath(repo);
+  if (fs.existsSync(bareDir)) {
+    await execFileAsync('git', [
+      '--git-dir', bareDir,
+      'fetch', 'origin', '+refs/heads/*:refs/heads/*',
+    ]);
+    return;
+  }
+  fs.mkdirSync(path.dirname(bareDir), { recursive: true });
+  await execFileAsync('git', ['clone', '--bare', `https://github.com/${repo}.git`, bareDir]);
+}
+
+// Purely local: `git worktree add` never touches the remote. Re-points an
+// existing worktree with `--force` when re-reviewing at a new head_sha.
+export async function addOrUpdateWorktree(
+  repo: string,
+  prNumber: number,
+  headSha: string
+): Promise<string> {
+  const bareDir = getBareRepoPath(repo);
+  const worktreeDir = getWorktreePath(repo, prNumber);
+  fs.mkdirSync(path.dirname(worktreeDir), { recursive: true });
+
+  const args = ['--git-dir', bareDir, 'worktree', 'add'];
+  if (fs.existsSync(worktreeDir)) args.push('--force');
+  args.push('--detach', worktreeDir, headSha);
+
+  await execFileAsync('git', args);
+  return worktreeDir;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/lib/repoCache.test.ts`
+Expected: PASS, 6 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/lib/repoCache.ts src/lib/repoCache.test.ts
+git commit -m "feat(lib): add bare-clone/fetch/worktree repo cache (read-only against remote)"
+```
+
+---
+
+### Task 3.2: Run `copilot -p` headless with a timeout
+
+**Files:**
+- Create: `src/lib/reviewRunner.ts`
+- Test: `src/lib/reviewRunner.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+`src/lib/reviewRunner.test.ts`:
+```typescript
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { EventEmitter } from 'node:events';
+
+class FakeChildProcess extends EventEmitter {
+  stdout = new EventEmitter();
+  stderr = new EventEmitter();
+  killed = false;
+  kill(signal?: string) {
+    this.killed = true;
+    this.emit('__killed__', signal);
+  }
+}
+
+let fakeChild: FakeChildProcess;
+const spawnMock = vi.fn(() => fakeChild);
+vi.mock('node:child_process', () => ({
+  spawn: (...args: unknown[]) => spawnMock(...args),
+}));
+
+const { runReview } = await import('./reviewRunner');
+
+describe('runReview', () => {
+  beforeEach(() => {
+    fakeChild = new FakeChildProcess();
+    spawnMock.mockClear();
+  });
+
+  it('resolves success=true with captured stdout on a zero exit code', async () => {
+    const promise = runReview('/tmp/worktree', 'review this PR');
+    fakeChild.stdout.emit('data', Buffer.from('# Report\n'));
+    fakeChild.emit('close', 0);
+
+    const result = await promise;
+    expect(result).toEqual({ success: true, output: '# Report\n' });
+    expect(spawnMock).toHaveBeenCalledWith('copilot', ['-p', 'review this PR'], { cwd: '/tmp/worktree' });
+  });
+
+  it('resolves success=false with the exit code and stderr on a non-zero exit', async () => {
+    const promise = runReview('/tmp/worktree', 'review this PR');
+    fakeChild.stdout.emit('data', Buffer.from('partial output'));
+    fakeChild.stderr.emit('data', Buffer.from('boom'));
+    fakeChild.emit('close', 1);
+
+    const result = await promise;
+    expect(result.success).toBe(false);
+    expect(result.output).toBe('partial output');
+    expect(result.errorMessage).toContain('exited with code 1');
+    expect(result.errorMessage).toContain('boom');
+  });
+
+  it('resolves success=false when the process errors to spawn (e.g. binary not found)', async () => {
+    const promise = runReview('/tmp/worktree', 'review this PR');
+    fakeChild.emit('error', new Error('spawn copilot ENOENT'));
+
+    const result = await promise;
+    expect(result.success).toBe(false);
+    expect(result.errorMessage).toBe('spawn copilot ENOENT');
+  });
+
+  it('kills the process and resolves success=false after the timeout elapses', async () => {
+    vi.useFakeTimers();
+    const promise = runReview('/tmp/worktree', 'review this PR', 1000);
+
+    vi.advanceTimersByTime(1000);
+    expect(fakeChild.killed).toBe(true);
+    fakeChild.emit('close', null); // killed processes report a null exit code
+
+    const result = await promise;
+    expect(result.success).toBe(false);
+    expect(result.errorMessage).toContain('timed out');
+    vi.useRealTimers();
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/lib/reviewRunner.test.ts`
+Expected: FAIL — `Cannot find module './reviewRunner'`.
+
+- [ ] **Step 3: Write `src/lib/reviewRunner.ts`**
+
+```typescript
+import { spawn } from 'node:child_process';
+
+export interface RunReviewResult {
+  success: boolean;
+  output: string;
+  errorMessage?: string;
+}
+
+const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes, per spec
+
+export function runReview(
+  cwd: string,
+  prompt: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS
+): Promise<RunReviewResult> {
+  return new Promise((resolve) => {
+    const child = spawn('copilot', ['-p', prompt], { cwd });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
+
+    const settle = (result: RunReviewResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    child.on('error', (err: Error) => {
+      settle({ success: false, output: stdout, errorMessage: err.message });
+    });
+
+    child.on('close', (code: number | null) => {
+      if (timedOut) {
+        settle({
+          success: false,
+          output: stdout,
+          errorMessage: `copilot timed out after ${timeoutMs}ms`,
+        });
+        return;
+      }
+      if (code !== 0) {
+        settle({
+          success: false,
+          output: stdout,
+          errorMessage: `copilot exited with code ${code}: ${stderr}`,
+        });
+        return;
+      }
+      settle({ success: true, output: stdout });
+    });
+  });
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/lib/reviewRunner.test.ts`
+Expected: PASS, 4 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/lib/reviewRunner.ts src/lib/reviewRunner.test.ts
+git commit -m "feat(lib): spawn copilot -p headless with a timeout"
+```
+---
+
+### Task 3.3: Run full test suite for Chunk 3
+
+- [ ] **Step 1: Run the whole suite**
+
+Run: `npm run test`
+Expected: all Chunk 1, 2, and 3 test files pass (client: 2, config: 3,
+pullRequests: 11, findings: 3, decision: 9, gh: 3, parseReviewOutput: 7,
+reviewPrompt: 1, repoCache: 6, reviewRunner: 4 — 49 tests total).
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add -A
+git commit -m "test: verify chunk 3 repo cache and review execution passes as a whole" --allow-empty
+```
+
+---
