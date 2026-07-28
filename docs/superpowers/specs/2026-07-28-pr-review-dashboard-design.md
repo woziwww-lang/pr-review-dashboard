@@ -57,7 +57,14 @@ preference, but the product itself targets English-speaking developers.
   Next.js dev mode can invoke `register()` more than once (e.g., on hot
   reload), the hook guards itself with a module-level flag (e.g. a global
   singleton keyed off `globalThis`) so a second invocation is a no-op and
-  only one cron job is ever active per process.
+  only one cron job is ever active per process. On every process start
+  (including after a crash), before the first poll tick runs, any row left
+  in `review_status='pending'` or `'reviewing'` from a previous process is
+  reset to `'failed'` with `error_message='Interrupted by process
+  restart'` — this guarantees no PR can be permanently stuck against the
+  single-flight rule; it will be picked up again on the next poll tick
+  (new PR / `head_sha` differs from `reviewed_head_sha`, which is
+  unaffected by this reset) or via manual "Re-check now".
 - **Data flow**:
   1. Cron job runs `gh pr list --repo <owner/repo> --state open --json
      number,title,author,headRefName,headRefOid,baseRefName,isDraft,url`.
@@ -91,11 +98,12 @@ preference, but the product itself targets English-speaking developers.
      this entire step is skipped for that tick — no rows are upserted or
      closed — and `config` `key='last_poll_status'` is set to `'error'`
      with `key='last_poll_error'` holding the message. On success, update
-     `config` `key='last_poll_at'` (current timestamp) and
-     `key='last_poll_status'='ok'`. The List Page header shows both the
-     timestamp and, if the last attempt failed, a visible "last poll
-     failed: <error>" indicator so stale data is never presented as
-     fresh.
+     `config` `key='last_poll_at'` (current timestamp), set
+     `key='last_poll_status'='ok'`, and clear `key='last_poll_error'` (set
+     to an empty value) so a stale error message doesn't linger after
+     recovery. The List Page header shows both the timestamp and, if the
+     last attempt failed, a visible "last poll failed: <error>" indicator
+     so stale data is never presented as fresh.
   3. The queue built in step 2 is processed in-process, one PR at a time
      (a PR sits in `review_status='pending'` from the moment it's enqueued
      until its turn comes up later in the same tick, which may take a
@@ -223,7 +231,11 @@ new set, and `pull_requests` fields are overwritten in place.
   in v1). Table
   columns: PR number, title, branch, author, last reviewed time, verdict
   badge, CRITICAL+HIGH count. Rows in `review_status='reviewing'` show an
-  in-progress indicator. Header shows the configured repo
+  in-progress indicator; rows in `review_status='failed'` show an ❌
+  "review failed" badge instead of a verdict badge (with the CRITICAL/HIGH
+  column showing the last successful counts if `last_reviewed_at` is set,
+  or `-` if it's `NULL`, i.e. never successfully reviewed). Header shows
+  the configured repo
   (`config.target_repo`), last poll time (`config.last_poll_at`), and — if
   `config.last_poll_status='error'` — a warning banner with
   `config.last_poll_error` so the user knows the list may be stale.
