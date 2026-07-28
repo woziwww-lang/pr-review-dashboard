@@ -20,7 +20,12 @@ polling, review pipeline, API contracts, or view-model shapes.
 - No light mode / theme toggle. Dark mode only.
 - No changes to `src/lib/*ViewModel.ts` data shapes, API routes, DB schema,
   or the poll/review pipeline. Anything under `src/lib`, `src/db`,
-  `src/instrumentation*.ts` is untouched by this work.
+  `src/instrumentation*.ts` is untouched by this work. (One exception,
+  scoped narrowly: the "Re-check now" *client-side submission mechanism*
+  changes from a native HTML form POST to a `fetch()` call, purely to fix
+  a real interaction gap — see `RecheckButton` below. This does not touch
+  `/api/recheck/[number]`'s method, URL, request, or response contract at
+  all.)
 - No changes to the 106 existing lib/API/view-model tests' assertions on
   data — they must continue to pass unmodified except where a component
   test's DOM-structure assertions need updating to match new markup (see
@@ -73,16 +78,16 @@ spacious variant even for repos with many open PRs, and confirmed motion
     - `HIGH` → solid `#F87171` background, `#450A0A` text
     - `MEDIUM` → solid `#FBBF24` background, `#451A03` text
     - `LOW` → solid `#3F3F46` background, `#D4D4D8` text
-  - In-progress row state (`listPageViewModel`'s `isInProgress`, true when
-    `review_status` is `'pending'` or `'reviewing'`): rendered as a
-    de-emphasized card (reduced opacity ~0.7 on the verdict/severity area)
-    with a small pulsing dot + "Reviewing…" / "Queued…" label in place of
-    the verdict badge (label text sourced from the existing
-    `reviewStatus` field passed through by the view model — no new data
-    needed). The "Re-check now" action is hidden/disabled for
-    in-progress rows, matching current behavior (re-checking a row that's
-    already being checked is a no-op per `forceRecheck`'s
-    `already-in-progress` result).
+  - In-progress row state (`ListPageRowViewModel.isInProgress`, true when
+    `review_status` is `'pending'` or `'reviewing'` — this is the only
+    signal the view model exposes; it does not distinguish pending vs.
+    reviewing, so the UI uses a single generic label, matching today's
+    actual List Page behavior at `src/app/page.tsx:69`
+    (`row.isInProgress ? 'Reviewing…' : <VerdictBadge .../>`)): rendered as
+    a de-emphasized card (reduced opacity ~0.7 on the verdict/severity
+    area) with a small pulsing dot + "Reviewing…" label in place of the
+    verdict badge. The `RecheckButton` (below) is disabled for
+    in-progress rows/PRs.
   - Accent (primary actions, e.g. "Re-check now" button): blue gradient
     `#3B82F6 → #2563EB`
 - **Typography**: `Geist Sans` for UI text/headings, `Geist Mono` for
@@ -150,21 +155,47 @@ continue to pass without modification).
    - "← Back to list" link: restyled with the `ArrowLeft` lucide icon.
 
 3. **New shared component: `RecheckButton`** (`src/app/components/
-   RecheckButton.tsx`) — a single client component used by *both* the
-   List Page's per-row action and the Detail Page's header action, so the
-   loading-state behavior is implemented once, not duplicated:
-   - Props: `prNumber: number` (the only new prop needed — it POSTs to the
-     existing `/api/recheck/[number]` route, no API changes).
-   - Renders the existing form/button; on submit, shows an inline loading
-     state (`Loader2` spinner + "Re-checking…" text) while the request is
-     in flight — this is purely a client-side visual state around the
-     existing form submission, not a change to the API contract or a new
-     client-side polling mechanism.
-   - Hidden/disabled automatically when the row/PR is already
-     `isInProgress` (List Page) or already `reviewing`/`pending` (Detail
-     Page), matching the existing `already-in-progress` semantics of
-     `forceRecheck` — this is a presentational reflection of data the
-     view models already expose, not new business logic.
+   RecheckButton.tsx`) — a single **Client Component** (`'use client'`)
+   used by *both* the List Page's per-row action and the Detail Page's
+   header action, so the fetch/loading-state logic is implemented once,
+   not duplicated:
+   - Props: `prNumber: number` and `disabled: boolean` (computed by the
+     *parent Server Component* from data it already has in scope — see
+     below — and passed down; `RecheckButton` itself does not know about
+     `review_status`/`isInProgress` and needs no new view-model fields).
+   - **Behavior change from today (in scope, not a new feature — a
+     interaction-correctness fix needed to make this "silky"):**
+     currently both pages render a plain `<form method="post"
+     action="/api/recheck/[number]">`. Submitting that form causes the
+     browser to navigate to `/api/recheck/[number]` and render its raw
+     JSON response as the new page — there is no inline loading state or
+     staying on the dashboard page today. `RecheckButton` replaces this
+     with a client-side `fetch('/api/recheck/' + prNumber, { method:
+     'POST' })` call (same endpoint, same method, zero API changes),
+     handled as:
+     - While the request is in flight: button shows `Loader2` spinner +
+       "Re-checking…" text, and is disabled to prevent double-submits.
+     - `202` response (`status: 'started'` or `status: 'queued'`): on
+       success, call `router.refresh()` (from `next/navigation`) so the
+       enclosing Server Component re-fetches DB state and the row/page
+       flips to its in-progress visual treatment; briefly show a success
+       micro-state (e.g. checkmark flash) before the refresh completes.
+     - `409` (`already-in-progress`): no-op path in practice since the
+       button is `disabled` whenever the parent already knows the PR is
+       in progress, but if a race still produces 409, show a brief inline
+       "Already in progress" message instead of an error.
+     - `404` / `502` / `400` / `500`: show a brief inline error message
+       (e.g. "Re-check failed: <error text from response body>") near the
+       button; button returns to its normal (non-loading) state so the
+       user can retry.
+   - `disabled` prop wiring: List Page passes `row.isInProgress` (already
+     computed by `buildListRowViewModel`, no changes needed there); Detail
+     Page computes `pr.review_status === 'pending' || pr.review_status
+     === 'reviewing'` directly in `page.tsx` from the `PullRequestRow`
+     it already fetches via `getByNumber` — this is a page-level
+     presentational computation, not an addition to
+     `DetailPageViewModel`'s shape (which the spec's Non-Goals require to
+     stay unchanged).
 
 4. **Existing shared components** (`src/app/components/`):
    - `VerdictBadge.tsx`, `SeverityBadge.tsx`: re-implemented using shadcn's
@@ -195,14 +226,22 @@ warning-colored `Card`/banner instead of plain text).
   assertion) to match new shadcn-based markup, but the underlying
   assertions (what text/labels/states are shown for a given prop) must not
   change.
-- **New**: no new automated visual-regression tooling is being introduced
-  (out of scope) — verification is manual: `npm run build` (confirms no
+- **New**: `src/app/components/RecheckButton.test.tsx` — this is new
+  client-side interaction logic (the fetch-based submit/loading/error
+  handling described above), not just markup, so it needs real test
+  coverage: mock `fetch` and `next/navigation`'s `useRouter().refresh`,
+  and assert the loading/success/error-message states for `202`, `409`,
+  and error status codes, plus that the button renders `disabled` when
+  the `disabled` prop is true.
+- No new automated visual-regression tooling is being introduced (out of
+  scope) — visual verification is manual: `npm run build` (confirms no
   build breakage from the Tailwind/shadcn addition) + `npm run dev` against
   real seeded/live data (reusing the manual-verification pattern already
   established in Chunk 5/6/7 of the original implementation) to visually
   confirm List Page, Detail Page, and the Re-check loading state.
 - Full suite (currently 106 tests) must remain green after the redesign,
-  accounting for any component-test updates described above.
+  accounting for any component-test updates and the new `RecheckButton`
+  tests described above.
 
 ## Rollout
 
