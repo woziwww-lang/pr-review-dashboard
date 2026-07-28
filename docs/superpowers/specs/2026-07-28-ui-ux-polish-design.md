@@ -16,7 +16,12 @@ polling, review pipeline, API contracts, or view-model shapes.
 
 - No new functional features (no search/filter/sort on the PR list, no
   pagination). Confirmed with the user: keep the spacious card style even
-  with 20+ PRs; scrolling is acceptable.
+  with 20+ PRs; scrolling is acceptable. (One small, intentional
+  navigational addition: a "← Back to list" link on the Detail Page,
+  which does not exist today. This is a pure navigation affordance with
+  no new data/logic — it links to the existing List Page route `/` — but
+  is called out explicitly here since it is technically new markup, not
+  a restyle of something pre-existing.)
 - No light mode / theme toggle. Dark mode only.
 - No changes to `src/lib/*ViewModel.ts` data shapes, API routes, DB schema,
   or the poll/review pipeline. Anything under `src/lib`, `src/db`,
@@ -210,8 +215,15 @@ continue to pass without modification).
 
 ## Error Handling
 
-No new error states are introduced. Existing error/edge-case rendering
-(e.g., "no successful review yet" banner, `(not configured)` repo
+No new *data/business-logic* error states are introduced — the polling
+pipeline, review pipeline, and API contracts are unchanged. The one
+addition is purely transient, client-side UI feedback around the
+`RecheckButton` fetch call described above (loading spinner, brief
+success flash, inline "already in progress" note on a `409`, inline
+error text on `404`/`502`/`400`/`500`) — these are ephemeral UI states
+tied to a single button interaction, not new persisted error states or
+new failure modes in the underlying system. Existing error/edge-case
+rendering (e.g., "no successful review yet" banner, `(not configured)` repo
 fallback, failed-review warning banner) keeps its current conditional
 logic — only its visual treatment changes (e.g., rendered as a
 warning-colored `Card`/banner instead of plain text).
