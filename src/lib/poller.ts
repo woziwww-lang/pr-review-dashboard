@@ -82,7 +82,7 @@ async function processQueue(db: Database.Database, repo: string): Promise<void> 
   }
 }
 
-async function processOnePr(
+export async function processOnePr(
   db: Database.Database,
   repo: string,
   id: number,
