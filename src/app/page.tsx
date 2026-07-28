@@ -3,9 +3,11 @@ import { getDb } from '../db/client';
 import { getConfig } from '../db/config';
 import { getOpenPrs } from '../db/pullRequests';
 import { buildListPageViewModel } from '../lib/listPageViewModel';
+import { buildSeveritySummary } from '../lib/severitySummary';
 import { VerdictBadge } from './components/VerdictBadge';
 import { PollStatusBanner } from './components/PollStatusBanner';
 import { RecheckButton } from './components/RecheckButton';
+import { SeveritySummaryBar } from './components/SeveritySummaryBar';
 import { Card } from './components/ui/card';
 
 export const dynamic = 'force-dynamic';
@@ -13,13 +15,15 @@ export const dynamic = 'force-dynamic';
 export default function ListPage() {
   const db = getDb();
   const repo = getConfig(db, 'target_repo') ?? '(not configured)';
+  const openPrs = getOpenPrs(db, repo);
   const vm = buildListPageViewModel({
     repo,
     lastPollAt: getConfig(db, 'last_poll_at') ?? null,
     lastPollStatus: (getConfig(db, 'last_poll_status') as 'ok' | 'error' | undefined) ?? null,
     lastPollError: getConfig(db, 'last_poll_error') ?? null,
-    prs: getOpenPrs(db, repo),
+    prs: openPrs,
   });
+  const severitySummary = buildSeveritySummary(openPrs);
 
   return (
     <main className="mx-auto flex max-w-4xl flex-col gap-6 px-6 py-10">
@@ -28,6 +32,7 @@ export default function ListPage() {
         <div className="mt-3">
           <PollStatusBanner lastPollAt={vm.lastPollAt} lastPollStatus={vm.pollStatus} lastPollError={vm.pollError} />
         </div>
+        <SeveritySummaryBar summary={severitySummary} />
       </div>
 
       <div className="flex flex-col gap-2.5">
