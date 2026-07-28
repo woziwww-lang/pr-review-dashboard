@@ -22,7 +22,10 @@ export function HoverLiftCard({ children, className }: { children: React.ReactNo
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
 
     const setY = gsap.quickTo(el, 'y', { duration: 0.25, ease: 'power2.out' });
-    const setShadow = gsap.quickTo(el, 'boxShadow', { duration: 0.25, ease: 'power2.out' });
+    // GSAP's quickTo .d.ts only types setters as numeric, even though string CSS properties like boxShadow work at runtime.
+    const setShadow = gsap.quickTo(el, 'boxShadow', { duration: 0.25, ease: 'power2.out' }) as unknown as (
+      value: string
+    ) => gsap.core.Tween;
 
     const handleEnter = () => {
       setY(-4);
