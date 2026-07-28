@@ -33,13 +33,13 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-6 px-6 py-10">
-      <Link href="/" className="flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-[#FAFAFA]">
+      <Link href="/" className="flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
         <ArrowLeft className="h-4 w-4" />
         Back to list
       </Link>
 
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <h1 className="text-2xl font-semibold text-[#FAFAFA]">
+        <h1 className="text-2xl font-semibold text-foreground">
           <span className="font-mono text-muted-foreground">#{vm.prNumber}</span> {vm.title}
         </h1>
         <RecheckButton prNumber={vm.prNumber} disabled={isInProgress} />
@@ -74,7 +74,7 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
 
       {vm.state !== 'failed-no-prior-success' && (
         <>
-          <Card className="flex flex-col gap-2 border-[#27272A] bg-[#18181B] p-4">
+          <Card className="flex flex-col gap-2 card-glass p-4">
             <h2 className="text-sm font-medium text-muted-foreground">Executive Summary</h2>
             {/* Note: DetailPageViewModel has no separate free-text
                 "summary" field (verified against src/lib/detailPageViewModel.ts)
@@ -82,20 +82,20 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
                 executive summary. No view-model change is made to
                 introduce a summary-text field, per the spec's Non-Goals. */}
             {vm.verdict && <VerdictBadge verdict={vm.verdict as 'approve' | 'needs_fix' | 'needs_review'} />}
-            <p className="text-sm text-[#D4D4D8]">
+            <p className="text-sm text-muted-foreground">
               Critical: {vm.severityCritical}, High: {vm.severityHigh}, Medium: {vm.severityMedium}, Low:{' '}
               {vm.severityLow}
             </p>
           </Card>
 
-          <Card className="flex flex-col gap-2 border-[#27272A] bg-[#18181B] p-4">
+          <Card className="flex flex-col gap-2 card-glass p-4">
             <h2 className="text-sm font-medium text-muted-foreground">Top Risks</h2>
             {vm.topRisks.map((f) => (
               <FindingCard key={f.id} finding={f} />
             ))}
           </Card>
 
-          <Card className="flex flex-col gap-2 border-[#27272A] bg-[#18181B] p-4 opacity-80">
+          <Card className="flex flex-col gap-2 card-glass p-4 opacity-80">
             <h2 className="text-sm font-medium text-muted-foreground">Medium/Low</h2>
             {vm.mediumLow.map((f) => (
               <FindingCard key={f.id} finding={f} />
@@ -103,7 +103,7 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
           </Card>
 
           {vm.rawReportMd && (
-            <details className="rounded-lg border border-[#27272A] bg-[#18181B] p-4">
+            <details className="card-glass p-4">
               <summary className="cursor-pointer text-sm font-medium text-muted-foreground">Raw report</summary>
               <pre className="mt-2 overflow-x-auto text-xs">{vm.rawReportMd}</pre>
             </details>
