@@ -55,10 +55,34 @@ spacious variant even for repos with many open PRs, and confirmed motion
   - Card border: `#27272A`
   - Primary text: `#FAFAFA`
   - Secondary/muted text: `#71717A` / `#A1A1AA`
-  - Success gradient (verdict: approve): `#22C55E → #16A34A`
-  - Warning gradient (verdict: needs_review / severity medium): `#FBBF24 →
-    #F59E0B`
-  - Danger (severity high/critical, error states): `#F87171` / `#EF4444`
+  - Verdict badge full mapping (`VerdictBadge`'s `BadgeVerdict` type has 4
+    values — all 4 must be styled, not just approve/needs_review):
+    - `approve` → success gradient `#22C55E → #16A34A`
+    - `needs_review` → warning gradient `#FBBF24 → #F59E0B`
+    - `needs_fix` → danger gradient `#F87171 → #DC2626` (distinct from
+      `failed` — this is a real review outcome, not an error state)
+    - `failed` → neutral/muted gray `#3F3F46` background, `#A1A1AA` text
+      (this means the review process itself errored, not a code-quality
+      verdict — must look visually distinct from `needs_fix`)
+  - Severity badge full mapping (`SeverityBadge`'s `Severity` type has 4
+    values — all 4 must be styled):
+    - `CRITICAL` → solid `#991B1B` background, `#FECACA` text (most
+      alarming, deliberately not a gradient — reserve gradients for
+      verdict badges so severity vs. verdict remain visually distinguishable
+      at a glance)
+    - `HIGH` → solid `#F87171` background, `#450A0A` text
+    - `MEDIUM` → solid `#FBBF24` background, `#451A03` text
+    - `LOW` → solid `#3F3F46` background, `#D4D4D8` text
+  - In-progress row state (`listPageViewModel`'s `isInProgress`, true when
+    `review_status` is `'pending'` or `'reviewing'`): rendered as a
+    de-emphasized card (reduced opacity ~0.7 on the verdict/severity area)
+    with a small pulsing dot + "Reviewing…" / "Queued…" label in place of
+    the verdict badge (label text sourced from the existing
+    `reviewStatus` field passed through by the view model — no new data
+    needed). The "Re-check now" action is hidden/disabled for
+    in-progress rows, matching current behavior (re-checking a row that's
+    already being checked is a no-op per `forceRecheck`'s
+    `already-in-progress` result).
   - Accent (primary actions, e.g. "Re-check now" button): blue gradient
     `#3B82F6 → #2563EB`
 - **Typography**: `Geist Sans` for UI text/headings, `Geist Mono` for
@@ -82,12 +106,16 @@ spacious variant even for repos with many open PRs, and confirmed motion
   utilities.
 - **shadcn/ui** components, initialized via its CLI (`components.json`,
   dark-only theme in `globals.css` using CSS variables) — install only the
-  primitives actually used: `Button`, `Card`, `Badge`, `Skeleton` (for any
-  loading placeholders), and `Separator`. Do not install shadcn components
-  this project has no use for.
+  primitives actually used: `Button`, `Card`, `Badge`. No other shadcn
+  primitives are installed for this change (no `Skeleton`/`Separator` —
+  nothing in this spec calls for a loading-skeleton placeholder or a
+  divider component; add them later only if a concrete need arises).
 - **lucide-react** for icons (per ui-ux-pro-max's anti-pattern guidance:
-  no emoji-as-icon). Only icons actually needed: back-arrow, spinner/loader,
-  check (approve), alert-triangle (needs_review/error).
+  no emoji-as-icon). Only icons actually needed: `ArrowLeft` (Detail
+  Page's "← Back to list" link), `Loader2` (spinner, used by the shared
+  recheck button described below), `CircleCheck` (approve verdict),
+  `TriangleAlert` (needs_review / needs_fix / failed verdicts and
+  error banners).
 - No new state-management, animation, or data-fetching libraries — this is
   a pure styling/markup change.
 
@@ -102,10 +130,11 @@ continue to pass without modification).
      at the top (unchanged data, restyled).
    - PR list: replace the native `<table>` with a vertically stacked list
      of card rows (one `shadcn Card` per PR), each showing: PR number
-     (mono font), title, branch, author, verdict badge (gradient pill),
-     severity count, last-reviewed timestamp, and the "Re-check now" form/
-     button — all fields sourced from the same `buildListPageViewModel`
-     output as today.
+     (mono font), title, branch, author, verdict badge (gradient pill) or
+     the in-progress treatment described above when `isInProgress` is
+     true, severity count, last-reviewed timestamp, and the shared
+     "Re-check now" button (see `RecheckButton` below) — all fields
+     sourced from the same `buildListPageViewModel` output as today.
 
 2. **`src/app/pr/[number]/page.tsx` (Detail Page)**
    - Executive Summary: a `Card` with the verdict badge + summary text.
@@ -116,18 +145,34 @@ continue to pass without modification).
      (smaller text/muted color) relative to Top Risks.
    - Raw report: kept as a collapsible/`<details>`-style section, restyled
      but behaviorally unchanged.
-   - "Re-check now" button: restyled as a primary gradient button; on click
-     shows an inline loading state (spinner + "Re-checking…" text) while
-     the request is in flight — this is purely a client-side visual state
-     around the existing form submission, not a change to the API contract
-     or a new client-side polling mechanism.
+   - "Re-check now" button: the shared `RecheckButton` component (see
+     below), restyled as a primary gradient button.
+   - "← Back to list" link: restyled with the `ArrowLeft` lucide icon.
 
-3. **Shared components** (`src/app/components/`):
+3. **New shared component: `RecheckButton`** (`src/app/components/
+   RecheckButton.tsx`) — a single client component used by *both* the
+   List Page's per-row action and the Detail Page's header action, so the
+   loading-state behavior is implemented once, not duplicated:
+   - Props: `prNumber: number` (the only new prop needed — it POSTs to the
+     existing `/api/recheck/[number]` route, no API changes).
+   - Renders the existing form/button; on submit, shows an inline loading
+     state (`Loader2` spinner + "Re-checking…" text) while the request is
+     in flight — this is purely a client-side visual state around the
+     existing form submission, not a change to the API contract or a new
+     client-side polling mechanism.
+   - Hidden/disabled automatically when the row/PR is already
+     `isInProgress` (List Page) or already `reviewing`/`pending` (Detail
+     Page), matching the existing `already-in-progress` semantics of
+     `forceRecheck` — this is a presentational reflection of data the
+     view models already expose, not new business logic.
+
+4. **Existing shared components** (`src/app/components/`):
    - `VerdictBadge.tsx`, `SeverityBadge.tsx`: re-implemented using shadcn's
-     `Badge` component with custom gradient variants; same props
-     (`verdict` / `severity` enums in, JSX out) — existing unit tests'
-     assertions on rendered text/labels continue to hold; only
-     class-name/DOM-structure assertions may need updating.
+     `Badge` component with custom gradient/solid variants per the full
+     4-value mappings above; same props (`verdict` / `severity` enums in,
+     JSX out) — existing unit tests' assertions on rendered text/labels
+     continue to hold; only class-name/DOM-structure assertions may need
+     updating.
    - `PollStatusBanner.tsx`: restyled as a small pill banner; same props.
    - `FindingCard.tsx`: restyled with the severity-colored left border
      described above; same props.
