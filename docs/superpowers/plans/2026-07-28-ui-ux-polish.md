@@ -581,11 +581,22 @@ export function RecheckButton({ prNumber, disabled }: { prNumber: number; disabl
   // refreshed server data now shows this PR as in-progress), hand off
   // from our own transient "success" overlay to the parent-driven
   // disabled state. Also guards against the fallback case via a timeout.
+  // Both branches schedule the state update via `setTimeout` (rather
+  // than calling `setState` synchronously in the effect body) to
+  // satisfy the `react-hooks/set-state-in-effect` lint rule (part of
+  // this project's `eslint-config-next` core-web-vitals config, error
+  // level) - calling setState directly and synchronously within an
+  // effect body triggers a same-commit cascading re-render, which the
+  // rule flags even when, as here, the update is otherwise correct and
+  // intentional. A `0ms` timeout for the `disabled: true` branch defers
+  // the update by one tick (imperceptible to the user - `findBy`/
+  // `waitFor` queries in tests correctly await it) without changing the
+  // actual handoff behavior.
   useEffect(() => {
     if (state.kind !== 'success') return;
     if (disabled) {
-      setState({ kind: 'idle' });
-      return;
+      const id = setTimeout(() => setState({ kind: 'idle' }), 0);
+      return () => clearTimeout(id);
     }
     const timeout = setTimeout(() => setState({ kind: 'idle' }), SUCCESS_FALLBACK_TIMEOUT_MS);
     return () => clearTimeout(timeout);
