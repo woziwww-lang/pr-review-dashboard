@@ -1,3 +1,5 @@
+import { TriangleAlert } from 'lucide-react';
+
 export function PollStatusBanner({
   lastPollAt,
   lastPollStatus,
@@ -8,11 +10,15 @@ export function PollStatusBanner({
   lastPollError: string | null;
 }) {
   return (
-    <div>
-      <p>Last poll: {lastPollAt ?? 'never'}</p>
+    <div className="flex flex-col gap-2">
+      <p className="text-sm text-muted-foreground">Last poll: {lastPollAt ?? 'never'}</p>
       {lastPollStatus === 'error' && (
-        <div role="alert" style={{ background: '#fff8c5', padding: 8, borderRadius: 4 }}>
-          ⚠ Last poll failed: {lastPollError}
+        <div
+          role="alert"
+          className="flex items-center gap-2 rounded-lg border border-[#451A03] bg-[#FBBF24]/10 px-3 py-2 text-sm text-[#FBBF24]"
+        >
+          <TriangleAlert className="h-4 w-4 shrink-0" />
+          Last poll failed: {lastPollError}
         </div>
       )}
     </div>
