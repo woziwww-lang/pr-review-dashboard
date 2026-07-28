@@ -14,7 +14,12 @@ export function runReview(
   timeoutMs: number = DEFAULT_TIMEOUT_MS
 ): Promise<RunReviewResult> {
   return new Promise((resolve) => {
-    const child = spawn('copilot', ['-p', prompt], { cwd });
+    // --allow-all-tools is required for non-interactive (`-p`) mode: without
+    // it, every shell/gh/MCP tool call the review skill makes is silently
+    // denied (no TTY to confirm against), which was previously causing the
+    // automated review to run in a severely degraded, permission-starved
+    // mode instead of a genuine failure or genuine success.
+    const child = spawn('copilot', ['-p', prompt, '--allow-all-tools'], { cwd });
     let stdout = '';
     let stderr = '';
     let timedOut = false;

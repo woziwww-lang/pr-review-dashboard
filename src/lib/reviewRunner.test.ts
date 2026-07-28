@@ -32,7 +32,11 @@ describe('runReview', () => {
 
     const result = await promise;
     expect(result).toEqual({ success: true, output: '# Report\n' });
-    expect(spawnMock).toHaveBeenCalledWith('copilot', ['-p', 'review this PR'], { cwd: '/tmp/worktree' });
+    expect(spawnMock).toHaveBeenCalledWith(
+      'copilot',
+      ['-p', 'review this PR', '--allow-all-tools'],
+      { cwd: '/tmp/worktree' }
+    );
   });
 
   it('resolves success=false with the exit code and stderr on a non-zero exit', async () => {
