@@ -82,10 +82,20 @@ preference, but the product itself targets English-speaking developers.
        result (i.e., not open in any form, draft or not — closed or
        merged) is marked `pr_state='closed'`; its row and last review are
        kept for reference, but the List Page's default view filters to
-       `pr_state='open'` only.
-     Update the `config` row `key='last_poll_at'` with the current
-     timestamp on every poll tick (success or partial failure), so the
-     List Page header can display it.
+       `pr_state='open' AND is_draft=0` — drafts are tracked in the
+       database (so they aren't misclassified as closed while in draft)
+       but stay entirely hidden from the dashboard UI in v1, matching the
+       "only track non-draft open PRs" requirement; they are never
+       reviewed and never shown until they leave draft state.
+     If the `gh pr list` call itself fails (e.g., network/auth error),
+     this entire step is skipped for that tick — no rows are upserted or
+     closed — and `config` `key='last_poll_status'` is set to `'error'`
+     with `key='last_poll_error'` holding the message. On success, update
+     `config` `key='last_poll_at'` (current timestamp) and
+     `key='last_poll_status'='ok'`. The List Page header shows both the
+     timestamp and, if the last attempt failed, a visible "last poll
+     failed: <error>" indicator so stale data is never presented as
+     fresh.
   3. The queue built in step 2 is processed in-process, one PR at a time
      (a PR sits in `review_status='pending'` from the moment it's enqueued
      until its turn comes up later in the same tick, which may take a
@@ -147,7 +157,8 @@ preference, but the product itself targets English-speaking developers.
 CREATE TABLE config (
   key TEXT PRIMARY KEY,
   value TEXT
-); -- e.g. ('target_repo', 'owner/name'), ('last_poll_at', ISO timestamp)
+); -- e.g. ('target_repo', 'owner/name'), ('last_poll_at', ISO timestamp),
+   -- ('last_poll_status', 'ok'|'error'), ('last_poll_error', message)
 
 CREATE TABLE pull_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,12 +218,15 @@ new set, and `pull_requests` fields are overwritten in place.
 
 ## Pages & Components
 
-- **List Page (`/`)**: Server Component querying `pull_requests` filtered to
-  `pr_state='open'` by default. Table
+- **List Page (`/`)**: Server Component querying `pull_requests` filtered
+  to `pr_state='open' AND is_draft=0` (drafts are stored but never shown
+  in v1). Table
   columns: PR number, title, branch, author, last reviewed time, verdict
   badge, CRITICAL+HIGH count. Rows in `review_status='reviewing'` show an
   in-progress indicator. Header shows the configured repo
-  (`config.target_repo`) and last poll time (`config.last_poll_at`).
+  (`config.target_repo`), last poll time (`config.last_poll_at`), and — if
+  `config.last_poll_status='error'` — a warning banner with
+  `config.last_poll_error` so the user knows the list may be stale.
   Clicking a row navigates to `/pr/[number]`.
 - **Detail Page (`/pr/[number]`)**:
   - Executive Summary (verdict + severity counts).
@@ -221,15 +235,21 @@ new set, and `pull_requests` fields are overwritten in place.
   - Medium/Low findings summarized as a list.
   - Collapsible full `raw_report_md` as a fallback (protects against gaps
     in structured parsing).
-  - If `review_status='failed'`: the page still renders the previous
-    successful review data in full (Executive Summary, Top Risks,
-    Medium/Low, raw report) since that is what's stored, but shows a
-    prominent banner above it: "⚠ Latest re-check failed at
-    `<last_attempted_at>`: `<error_message>`. Showing results from the
-    last successful review (`<last_reviewed_at>`, commit
+  - If `review_status='failed'` and `last_reviewed_at` is set (a previous
+    successful review exists): the page still renders that previous
+    review data in full (Executive Summary, Top Risks, Medium/Low, raw
+    report), but shows a prominent banner above it: "⚠ Latest re-check
+    failed at `<last_attempted_at>`: `<error_message>`. Showing results
+    from the last successful review (`<last_reviewed_at>`, commit
     `<reviewed_head_sha>`)." plus a "Retry" action. This makes clear to
     the user that the visible findings may not reflect the PR's current
     code.
+  - If `review_status='failed'` and `last_reviewed_at` is `NULL` (the PR
+    has never been successfully reviewed, e.g. it failed on first
+    attempt): there is no prior data to fall back to, so the page shows
+    only an error state — "Review failed at `<last_attempted_at>`:
+    `<error_message>`. No successful review yet." plus a "Retry" action —
+    with no Executive Summary/Top Risks/findings sections rendered.
 - Both pages expose a "Re-check now" button that calls an API route to
   force an immediate review cycle for that PR.
 
