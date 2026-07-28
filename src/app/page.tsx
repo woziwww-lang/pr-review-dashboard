@@ -1,66 +1,96 @@
-import Image from "next/image";
-import styles from "./page.module.css";
+import Link from 'next/link';
+import { getDb } from '../db/client';
+import { getConfig } from '../db/config';
+import { getOpenPrs } from '../db/pullRequests';
+import { buildListPageViewModel } from '../lib/listPageViewModel';
+import { VerdictBadge } from './components/VerdictBadge';
+import { PollStatusBanner } from './components/PollStatusBanner';
 
-export default function Home() {
+export const dynamic = 'force-dynamic';
+
+export default function ListPage() {
+  const db = getDb();
+  const repo = getConfig(db, 'target_repo') ?? '(not configured)';
+  const vm = buildListPageViewModel({
+    repo,
+    lastPollAt: getConfig(db, 'last_poll_at') ?? null,
+    lastPollStatus: (getConfig(db, 'last_poll_status') as 'ok' | 'error' | undefined) ?? null,
+    lastPollError: getConfig(db, 'last_poll_error') ?? null,
+    prs: getOpenPrs(db, repo),
+  });
+
   return (
-    <div className={styles.page}>
-      <main className={styles.main}>
-        <Image
-          className={styles.logo}
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className={styles.intro}>
-          <h1>To get started, edit the page.tsx file.</h1>
-          <p>
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className={styles.ctas}>
-          <a
-            className={styles.primary}
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className={styles.logo}
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className={styles.secondary}
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+    <main>
+      <h1>{vm.repo}</h1>
+      <PollStatusBanner lastPollAt={vm.lastPollAt} lastPollStatus={vm.pollStatus} lastPollError={vm.pollError} />
+      <table>
+        <thead>
+          <tr>
+            <th>PR</th>
+            <th>Title</th>
+            <th>Branch</th>
+            <th>Author</th>
+            <th>Verdict</th>
+            <th>Critical+High</th>
+            <th>Last reviewed</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {vm.rows.map((row) => (
+            // Server Components can't attach an onClick handler to the
+            // <tr> itself (that would require a Client Component), so
+            // "clicking a row navigates" is satisfied instead by making
+            // every data cell in the row a full-cell <Link> (styled to
+            // `display: block` so the whole cell area, not just the
+            // text, is clickable) - only the "Re-check now" form/button
+            // cell is excluded, since it must submit a POST rather than
+            // navigate.
+            <tr key={row.prNumber}>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  #{row.prNumber}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.title}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.branch}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.author}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.isInProgress ? 'Reviewing…' : <VerdictBadge verdict={row.badgeVerdict} />}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.criticalHighCount ?? '-'}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.lastReviewedAt ?? '-'}
+                </Link>
+              </td>
+              <td>
+                <form action={`/api/recheck/${row.prNumber}`} method="post">
+                  <button type="submit">Re-check now</button>
+                </form>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </main>
   );
 }
