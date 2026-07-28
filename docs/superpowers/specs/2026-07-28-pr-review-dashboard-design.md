@@ -36,6 +36,15 @@ preference, but the product itself targets English-speaking developers.
   Medium/Low summary → supporting diff/evidence.
 - Run everything from a single process (`npm run dev`) for simplicity in a
   local dev context.
+- **All git operations against the remote/GitHub are strictly read-only.**
+  The tool only ever runs `git clone --bare`, `git fetch`, and local
+  `git worktree add`/checkout operations to inspect PR code. It never runs
+  `git push`, never creates/updates/deletes any remote branch, and never
+  writes back to GitHub (no PR comments, no status checks, no labels) in
+  v1 — the dashboard only reads PR metadata (via `gh pr list`) and code
+  (via local git), and surfaces results in its own local UI/DB. This
+  applies to every component that touches the remote repo: the poller,
+  the repo-cache/worktree manager, and the review runner.
 
 ## Non-Goals
 
@@ -44,6 +53,8 @@ preference, but the product itself targets English-speaking developers.
 - Webhook-based real-time triggering (deferred in favor of polling).
 - Review history / trend tracking (only the latest review is kept).
 - Auto-fixing code (the underlying skill is review-only by default).
+- Writing back to GitHub in any form (PR comments, check runs, labels,
+  pushes) — the dashboard is a read-only observer of the remote repo.
 - Authentication/multi-user support (single local user, relies on local `gh`
   and `copilot` CLI auth).
 
@@ -116,15 +127,18 @@ preference, but the product itself targets English-speaking developers.
      module-level "poll in progress" flag): if a poll tick is still
      running (e.g., a slow `copilot` invocation) when the next scheduled
      tick fires, the new tick is skipped entirely and logged, rather than
-     starting a second, overlapping poll. Repo caching/worktree layout:
+     starting a second, overlapping poll. Repo caching/worktree layout
+     (read-only against the remote — fetch/clone only, never push):
      - A single bare/mirror clone per target repo lives at
        `~/.pr-review-dashboard/repos/<owner>__<repo>/repo.git` (created via
-       `git clone --bare` on first use, then `git fetch` on each poll).
+       `git clone --bare` on first use, then `git fetch` on each poll —
+       no other remote-mutating commands are ever run against it).
      - Each PR gets its own worktree at
        `~/.pr-review-dashboard/repos/<owner>__<repo>/worktrees/pr-<number>`,
        created with `git worktree add <path> <head_sha>` (or
        `git worktree add --force` re-pointed to the new `head_sha` when
-       re-reviewing) from the bare repo. The base branch is fetched into
+       re-reviewing) from the bare repo — purely a local checkout, never
+       pushed anywhere. The base branch is fetched into
        the same bare repo, so `git diff <baseRefName>...<head_sha>` can be
        computed from within the worktree without a separate checkout.
      - Mark `review_status = 'reviewing'` in the DB immediately so the UI
