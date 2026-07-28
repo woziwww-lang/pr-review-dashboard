@@ -21,6 +21,7 @@ pr-review-dashboard/
   next.config.ts
   .env.local.example          # TARGET_REPO=owner/name
   vitest.config.ts
+  vitest-setup.ts              # imports @testing-library/jest-dom/vitest for component tests
   src/
     instrumentation.ts        # registers cron job + crash recovery, once per process
                                # (lives under src/ per Next.js --src-dir convention)
@@ -54,26 +55,39 @@ pr-review-dashboard/
       poller.test.ts
       startupConfig.ts             # pure TARGET_REPO env-var validation (owner/name format check)
       startupConfig.test.ts
+      listPageViewModel.ts          # buildListRowViewModel/buildListPageViewModel: pure data-shaping for the List Page
+      listPageViewModel.test.ts
+      detailPageViewModel.ts        # buildDetailPageViewModel: pure data-shaping + failed-state logic for the Detail Page
+      detailPageViewModel.test.ts
+      recheck.ts                    # forceRecheck(db, repo, prNumber): the "Re-check now" button's shared logic
+      recheck.test.ts
     app/
-      layout.tsx
+      layout.tsx                  # created by the Task 1.1 scaffold, unmodified
       page.tsx                    # List Page (Server Component)
       pr/[number]/page.tsx        # Detail Page (Server Component)
       api/recheck/[number]/route.ts   # POST: force immediate review for one PR
+      api/recheck/[number]/route.test.ts
       components/
         VerdictBadge.tsx
+        VerdictBadge.test.tsx
         SeverityBadge.tsx
+        SeverityBadge.test.tsx
         PollStatusBanner.tsx
+        PollStatusBanner.test.tsx
         FindingCard.tsx
+        FindingCard.test.tsx
 ```
 
 **Responsibilities:**
 - `db/*`: all SQLite access. Nothing outside this folder touches `better-sqlite3` directly.
 - `lib/gh.ts`, `lib/repoCache.ts`, `lib/reviewRunner.ts`: thin wrappers around external processes (`gh`, `git`, `copilot`). Each does one external-process concern and is independently mockable.
 - `lib/parseReviewOutput.ts`, `lib/decision.ts`, `lib/startupConfig.ts`: pure functions, no I/O — the easiest things to unit test exhaustively.
-- `lib/poller.ts`: the only place that wires `gh.ts` + `repoCache.ts` + `reviewRunner.ts` + `parseReviewOutput.ts` + `db/*` together for one poll tick. This is also called directly by the "Re-check now" API route for a single PR.
+- `lib/poller.ts`: the only place that wires `gh.ts` + `repoCache.ts` + `reviewRunner.ts` + `parseReviewOutput.ts` + `db/*` together for one poll tick. `processOnePr` is also exported for `lib/recheck.ts` to reuse for a single forced PR.
+- `lib/recheck.ts`: shared logic behind the "Re-check now" button — refetches the PR's current `head_sha`, bypasses `decision.ts`'s gate, and kicks off `poller.ts`'s `processOnePr` under `queue.ts`'s poll-tick mutex.
+- `lib/listPageViewModel.ts`, `lib/detailPageViewModel.ts`: pure data-shaping functions consumed by `app/page.tsx` and `app/pr/[number]/page.tsx` respectively — kept out of the Server Components themselves so the badge/banner/failed-state branching logic is unit-testable without a React render pipeline.
 - `lib/queue.ts`: in-memory (not persisted) single-flight + mutex state, isolated so it can be unit tested without spawning real processes.
 - `instrumentation.ts`: the only place that wires `lib/startupConfig.ts` (validate env, exit on failure) + `db/pullRequests.ts`'s `resetStuckReviews` (crash recovery) + `node-cron` + `lib/queue.ts` + `lib/poller.ts` together at process boot. Deliberately not split into a separate `lib/startup.ts` — the boot sequence is a handful of sequential calls with no independent reusable logic, so a wrapper module would just add indirection.
-- `app/*`: Next.js UI, reads only through `db/*` functions, never touches `gh`/`git`/`copilot` directly.
+- `app/*`: Next.js UI, reads only through `db/*` functions (Server Components) or `lib/recheck.ts` (the API route), never touches `gh`/`git`/`copilot` directly. `app/components/*` are small presentational components tested with `@testing-library/react` under a per-file `jsdom` environment override (see Chunk 5, Task 5.1) while every other test file in the project runs under the default `node` environment.
 
 ---
 
@@ -2977,3 +2991,1538 @@ git commit -m "test: verify chunk 4 poller orchestration and cron scheduling pas
 ```
 
 ---
+
+## Chunk 5: Next.js UI — List Page and components
+
+This chunk builds the shared UI foundation on top of everything from
+Chunks 1–4: presentational components (`VerdictBadge`, `SeverityBadge`,
+`PollStatusBanner`), the component-test tooling they need, and the List
+Page along with its pure "view model" builder function (the testable
+logic deciding which badge/banner to show for each row). The Detail
+Page (Chunk 6) and the "Re-check now" API route (Chunk 7) build on top
+of this.
+
+### Task 5.1: Add component test tooling + `VerdictBadge`/`SeverityBadge`
+
+**Files:**
+- Modify: `package.json` (add test deps)
+- Create: `src/app/components/VerdictBadge.tsx`
+- Test: `src/app/components/VerdictBadge.test.tsx`
+- Create: `src/app/components/SeverityBadge.tsx`
+- Test: `src/app/components/SeverityBadge.test.tsx`
+- Create: `vitest-setup.ts`
+- Modify: `vitest.config.ts`
+
+- [ ] **Step 1: Install component test dependencies**
+
+Run:
+```bash
+npm install -D jsdom @testing-library/react @testing-library/jest-dom
+```
+
+- [ ] **Step 2: Add a jsdom project to `vitest.config.ts` for component tests**
+
+Component tests need a `jsdom` environment while every other test file in
+this plan relies on the default `node` environment (for `better-sqlite3`
+and child_process mocking) — rather than changing the global environment
+and risking breaking Chunks 1–4's tests, add a per-file override using
+Vitest's environment glob matching:
+
+```typescript
+import { defineConfig } from 'vitest/config';
+import path from 'path';
+
+export default defineConfig({
+  test: {
+    environment: 'node',
+    environmentMatchGlobs: [['src/app/**/*.test.tsx', 'jsdom']],
+    setupFiles: ['./vitest-setup.ts'],
+    globals: true,
+  },
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+});
+```
+
+`vitest-setup.ts`:
+```typescript
+import '@testing-library/jest-dom/vitest';
+```
+
+- [ ] **Step 3: Write the failing tests**
+
+`src/app/components/VerdictBadge.test.tsx`:
+```typescript
+import { describe, it, expect } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import { VerdictBadge } from './VerdictBadge';
+
+describe('VerdictBadge', () => {
+  it('renders an approve badge', () => {
+    render(<VerdictBadge verdict="approve" />);
+    expect(screen.getByText(/approve/i)).toBeInTheDocument();
+  });
+
+  it('renders a needs_fix badge', () => {
+    render(<VerdictBadge verdict="needs_fix" />);
+    expect(screen.getByText(/needs fix/i)).toBeInTheDocument();
+  });
+
+  it('renders a needs_review badge', () => {
+    render(<VerdictBadge verdict="needs_review" />);
+    expect(screen.getByText(/needs review/i)).toBeInTheDocument();
+  });
+
+  it('renders a failed badge distinct from any verdict', () => {
+    render(<VerdictBadge verdict="failed" />);
+    expect(screen.getByText(/review failed/i)).toBeInTheDocument();
+  });
+});
+```
+
+`src/app/components/SeverityBadge.test.tsx`:
+```typescript
+import { describe, it, expect } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import { SeverityBadge } from './SeverityBadge';
+
+describe('SeverityBadge', () => {
+  it.each(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'] as const)('renders %s', (severity) => {
+    render(<SeverityBadge severity={severity} />);
+    expect(screen.getByText(severity)).toBeInTheDocument();
+  });
+});
+```
+
+- [ ] **Step 4: Run tests to verify they fail**
+
+Run: `npm run test -- src/app/components/VerdictBadge.test.tsx src/app/components/SeverityBadge.test.tsx`
+Expected: FAIL — `Cannot find module './VerdictBadge'` / `'./SeverityBadge'`.
+
+- [ ] **Step 5: Write the components**
+
+`src/app/components/VerdictBadge.tsx`:
+```typescript
+export type BadgeVerdict = 'approve' | 'needs_fix' | 'needs_review' | 'failed';
+
+const LABELS: Record<BadgeVerdict, string> = {
+  approve: 'Approve',
+  needs_fix: 'Needs Fix',
+  needs_review: 'Needs Review',
+  failed: 'Review Failed',
+};
+
+const COLORS: Record<BadgeVerdict, string> = {
+  approve: '#1a7f37',
+  needs_fix: '#cf222e',
+  needs_review: '#9a6700',
+  failed: '#57606a',
+};
+
+export function VerdictBadge({ verdict }: { verdict: BadgeVerdict }) {
+  return (
+    <span
+      style={{ color: 'white', background: COLORS[verdict], padding: '2px 8px', borderRadius: 4 }}
+    >
+      {LABELS[verdict]}
+    </span>
+  );
+}
+```
+
+`src/app/components/SeverityBadge.tsx`:
+```typescript
+export type Severity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+
+const COLORS: Record<Severity, string> = {
+  CRITICAL: '#82071e',
+  HIGH: '#cf222e',
+  MEDIUM: '#9a6700',
+  LOW: '#57606a',
+};
+
+export function SeverityBadge({ severity }: { severity: Severity }) {
+  return (
+    <span
+      style={{ color: 'white', background: COLORS[severity], padding: '1px 6px', borderRadius: 4, fontSize: '0.8em' }}
+    >
+      {severity}
+    </span>
+  );
+}
+```
+
+- [ ] **Step 6: Run tests to verify they pass**
+
+Run: `npm run test -- src/app/components/VerdictBadge.test.tsx src/app/components/SeverityBadge.test.tsx`
+Expected: PASS, 8 tests (4 `VerdictBadge` cases + 4 `SeverityBadge` cases,
+the latter from one `it.each` producing 4 individually-counted cases; see
+Task 7.2 for the full-suite running total).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add package.json package-lock.json vitest.config.ts vitest-setup.ts src/app/components/VerdictBadge.tsx src/app/components/VerdictBadge.test.tsx src/app/components/SeverityBadge.tsx src/app/components/SeverityBadge.test.tsx
+git commit -m "feat(ui): add VerdictBadge/SeverityBadge components and jsdom test tooling"
+```
+
+---
+
+### Task 5.2: List Page view model + `PollStatusBanner`
+
+**Files:**
+- Create: `src/lib/listPageViewModel.ts`
+- Test: `src/lib/listPageViewModel.test.ts`
+- Create: `src/app/components/PollStatusBanner.tsx`
+- Test: `src/app/components/PollStatusBanner.test.tsx`
+
+The List Page's actual data-shaping logic (which badge to show, whether
+counts reflect a stale prior review) is pulled out into a pure,
+DB-independent function so it's fully unit-tested; `page.tsx` in Task 5.3
+will just call `getOpenPrs()` + this function + render.
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/lib/listPageViewModel.test.ts`:
+```typescript
+import { describe, it, expect } from 'vitest';
+import { buildListRowViewModel, type ListPageRowInput } from './listPageViewModel';
+
+function row(overrides: Partial<ListPageRowInput>): ListPageRowInput {
+  return {
+    prNumber: 1,
+    title: 'Add feature',
+    branch: 'feat/x',
+    author: 'alice',
+    reviewStatus: 'done',
+    verdict: 'approve',
+    severityCritical: 0,
+    severityHigh: 0,
+    lastReviewedAt: '2026-07-28T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+describe('buildListRowViewModel', () => {
+  it('shows the verdict badge and severity count for a done review', () => {
+    const vm = buildListRowViewModel(row({ verdict: 'needs_fix', severityCritical: 1, severityHigh: 2 }));
+    expect(vm.badgeVerdict).toBe('needs_fix');
+    expect(vm.criticalHighCount).toBe(3);
+    expect(vm.isInProgress).toBe(false);
+  });
+
+  it('shows an in-progress indicator for a reviewing row', () => {
+    const vm = buildListRowViewModel(row({ reviewStatus: 'reviewing' }));
+    expect(vm.isInProgress).toBe(true);
+  });
+
+  it('shows a failed badge and last successful counts when a prior review exists', () => {
+    const vm = buildListRowViewModel(
+      row({ reviewStatus: 'failed', verdict: 'approve', severityCritical: 0, severityHigh: 1, lastReviewedAt: '2026-07-28T00:00:00.000Z' })
+    );
+    expect(vm.badgeVerdict).toBe('failed');
+    expect(vm.criticalHighCount).toBe(1); // last successful counts, not blanked out
+  });
+
+  it('shows a failed badge with no count ("-") when there is no prior successful review', () => {
+    const vm = buildListRowViewModel(row({ reviewStatus: 'failed', lastReviewedAt: null }));
+    expect(vm.badgeVerdict).toBe('failed');
+    expect(vm.criticalHighCount).toBeNull();
+  });
+});
+```
+
+`src/app/components/PollStatusBanner.test.tsx`:
+```typescript
+import { describe, it, expect } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import { PollStatusBanner } from './PollStatusBanner';
+
+describe('PollStatusBanner', () => {
+  it('shows only the last poll time when the last poll succeeded', () => {
+    render(<PollStatusBanner lastPollAt="2026-07-28T00:00:00.000Z" lastPollStatus="ok" lastPollError={null} />);
+    expect(screen.queryByText(/last poll failed/i)).not.toBeInTheDocument();
+  });
+
+  it('shows a warning banner with the error message when the last poll failed', () => {
+    render(
+      <PollStatusBanner
+        lastPollAt="2026-07-28T00:00:00.000Z"
+        lastPollStatus="error"
+        lastPollError="gh: authentication required"
+      />
+    );
+    expect(screen.getByText(/last poll failed/i)).toBeInTheDocument();
+    expect(screen.getByText(/gh: authentication required/)).toBeInTheDocument();
+  });
+});
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `npm run test -- src/lib/listPageViewModel.test.ts src/app/components/PollStatusBanner.test.tsx`
+Expected: FAIL — modules not found.
+
+- [ ] **Step 3: Write the implementations**
+
+`src/lib/listPageViewModel.ts`:
+```typescript
+import type { BadgeVerdict } from '../app/components/VerdictBadge';
+
+export interface ListPageRowInput {
+  prNumber: number;
+  title: string;
+  branch: string;
+  author: string;
+  reviewStatus: 'pending' | 'reviewing' | 'done' | 'failed';
+  verdict: string | null;
+  severityCritical: number;
+  severityHigh: number;
+  lastReviewedAt: string | null;
+}
+
+export interface ListPageRowViewModel {
+  prNumber: number;
+  title: string;
+  branch: string;
+  author: string;
+  isInProgress: boolean;
+  badgeVerdict: BadgeVerdict;
+  criticalHighCount: number | null;
+  lastReviewedAt: string | null;
+}
+
+export function buildListRowViewModel(input: ListPageRowInput): ListPageRowViewModel {
+  const isInProgress = input.reviewStatus === 'reviewing' || input.reviewStatus === 'pending';
+  const isFailed = input.reviewStatus === 'failed';
+
+  const hasPriorSuccess = input.lastReviewedAt !== null;
+  // severityCritical/severityHigh always hold the counts from the last
+  // *successful* review (markFailed never touches them - see Chunk 1's
+  // pullRequests.ts) so they're safe to show whenever a prior success
+  // exists, even if the row's current status is 'failed'.
+  const criticalHighCount = isFailed && !hasPriorSuccess ? null : input.severityCritical + input.severityHigh;
+
+  return {
+    prNumber: input.prNumber,
+    title: input.title,
+    branch: input.branch,
+    author: input.author,
+    isInProgress,
+    badgeVerdict: isFailed ? 'failed' : ((input.verdict ?? 'needs_review') as BadgeVerdict),
+    criticalHighCount,
+    lastReviewedAt: input.lastReviewedAt,
+  };
+}
+```
+
+`src/app/components/PollStatusBanner.tsx`:
+```typescript
+export function PollStatusBanner({
+  lastPollAt,
+  lastPollStatus,
+  lastPollError,
+}: {
+  lastPollAt: string | null;
+  lastPollStatus: 'ok' | 'error' | null;
+  lastPollError: string | null;
+}) {
+  return (
+    <div>
+      <p>Last poll: {lastPollAt ?? 'never'}</p>
+      {lastPollStatus === 'error' && (
+        <div role="alert" style={{ background: '#fff8c5', padding: 8, borderRadius: 4 }}>
+          ⚠ Last poll failed: {lastPollError}
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npm run test -- src/lib/listPageViewModel.test.ts src/app/components/PollStatusBanner.test.tsx`
+Expected: PASS, 6 tests (4 + 2).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/lib/listPageViewModel.ts src/lib/listPageViewModel.test.ts src/app/components/PollStatusBanner.tsx src/app/components/PollStatusBanner.test.tsx
+git commit -m "feat(ui): add list page view model and poll status banner"
+```
+
+---
+
+### Task 5.3: List Page (`app/page.tsx`)
+
+**Files:**
+- Modify: `src/lib/listPageViewModel.ts` (add `buildListPageViewModel`)
+- Modify: `src/lib/listPageViewModel.test.ts`
+- Create: `src/app/page.tsx`
+
+- [ ] **Step 1: Write the failing test for the page-level view model**
+
+Append to `src/lib/listPageViewModel.test.ts`:
+```typescript
+import { buildListPageViewModel } from './listPageViewModel';
+import type { PullRequestRow } from '../db/pullRequests';
+
+function prRow(overrides: Partial<PullRequestRow>): PullRequestRow {
+  return {
+    id: 1,
+    repo: 'owner/name',
+    pr_number: 42,
+    title: 'Add feature',
+    author: 'alice',
+    branch: 'feat/x',
+    base_branch: 'main',
+    head_sha: 'abc123',
+    pr_url: 'https://github.com/owner/name/pull/42',
+    is_draft: 0,
+    pr_state: 'open',
+    review_status: 'done',
+    verdict: 'approve',
+    severity_critical: 0,
+    severity_high: 0,
+    severity_medium: 0,
+    severity_low: 0,
+    reviewed_head_sha: 'abc123',
+    last_reviewed_at: '2026-07-28T00:00:00.000Z',
+    last_attempted_at: '2026-07-28T00:00:00.000Z',
+    raw_report_md: '# report',
+    error_message: null,
+    ...overrides,
+  };
+}
+
+describe('buildListPageViewModel', () => {
+  it('maps DB rows into row view models sorted by PR number descending', () => {
+    const vm = buildListPageViewModel({
+      repo: 'owner/name',
+      lastPollAt: '2026-07-28T00:05:00.000Z',
+      lastPollStatus: 'ok',
+      lastPollError: null,
+      // Deliberately passed in ascending order so this test actually
+      // exercises the sort, rather than passing already-descending input
+      // that would pass even with a no-op or ascending sort.
+      prs: [prRow({ pr_number: 1 }), prRow({ pr_number: 2 })],
+    });
+    expect(vm.repo).toBe('owner/name');
+    expect(vm.rows.map((r) => r.prNumber)).toEqual([2, 1]);
+    expect(vm.pollStatus).toBe('ok');
+  });
+
+  it('propagates a failed poll error message into the view model', () => {
+    const vm = buildListPageViewModel({
+      repo: 'owner/name',
+      lastPollAt: '2026-07-28T00:05:00.000Z',
+      lastPollStatus: 'error',
+      lastPollError: 'gh: authentication required',
+      prs: [],
+    });
+    expect(vm.pollError).toBe('gh: authentication required');
+    expect(vm.rows).toHaveLength(0);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test -- src/lib/listPageViewModel.test.ts`
+Expected: FAIL — `buildListPageViewModel is not exported`.
+
+- [ ] **Step 3: Add `buildListPageViewModel` to `src/lib/listPageViewModel.ts`**
+
+Append to the file (below the existing `buildListRowViewModel`):
+```typescript
+import type { PullRequestRow } from '../db/pullRequests';
+
+export interface ListPageViewModelInput {
+  repo: string;
+  lastPollAt: string | null;
+  lastPollStatus: 'ok' | 'error' | null;
+  lastPollError: string | null;
+  prs: PullRequestRow[];
+}
+
+export interface ListPageViewModel {
+  repo: string;
+  lastPollAt: string | null;
+  pollStatus: 'ok' | 'error' | null;
+  pollError: string | null;
+  rows: ListPageRowViewModel[];
+}
+
+export function buildListPageViewModel(input: ListPageViewModelInput): ListPageViewModel {
+  return {
+    repo: input.repo,
+    lastPollAt: input.lastPollAt,
+    pollStatus: input.lastPollStatus,
+    // An empty string means "no error recorded" (see poller.ts's success
+    // path, which calls setConfig(db, 'last_poll_error', '')) - normalize
+    // that to null so the banner and this view model share one "no error"
+    // representation.
+    pollError: input.lastPollError || null,
+    rows: input.prs
+      .map((pr) =>
+        buildListRowViewModel({
+          prNumber: pr.pr_number,
+          title: pr.title,
+          branch: pr.branch,
+          author: pr.author,
+          reviewStatus: pr.review_status,
+          verdict: pr.verdict,
+          severityCritical: pr.severity_critical,
+          severityHigh: pr.severity_high,
+          lastReviewedAt: pr.last_reviewed_at,
+        })
+      )
+      // `getOpenPrs()` (db/pullRequests.ts) already queries with
+      // `ORDER BY pr_number DESC`, but this view model re-sorts
+      // defensively rather than trusting caller ordering, since it's a
+      // pure function that may be called with data from other sources
+      // (e.g. tests, future callers).
+      .sort((a, b) => b.prNumber - a.prNumber),
+  };
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npm run test -- src/lib/listPageViewModel.test.ts`
+Expected: PASS, 6 tests (4 existing + 2 new).
+
+- [ ] **Step 5: Write `src/app/page.tsx`**
+
+This is deliberately a thin Server Component: it fetches from SQLite and
+the `config` table, builds the view model, and renders. Per the design
+spec, no client-side data fetching is needed for initial render — the
+page re-runs on every navigation/refresh since it's an uncached Server
+Component (no `export const revalidate` / `fetch cache` is configured
+elsewhere in this plan).
+
+```tsx
+import Link from 'next/link';
+import { getDb } from '../db/client';
+import { getConfig } from '../db/config';
+import { getOpenPrs } from '../db/pullRequests';
+import { buildListPageViewModel } from '../lib/listPageViewModel';
+import { VerdictBadge } from './components/VerdictBadge';
+import { PollStatusBanner } from './components/PollStatusBanner';
+
+export const dynamic = 'force-dynamic';
+
+export default function ListPage() {
+  const db = getDb();
+  const repo = getConfig(db, 'target_repo') ?? '(not configured)';
+  const vm = buildListPageViewModel({
+    repo,
+    lastPollAt: getConfig(db, 'last_poll_at') ?? null,
+    lastPollStatus: (getConfig(db, 'last_poll_status') as 'ok' | 'error' | undefined) ?? null,
+    lastPollError: getConfig(db, 'last_poll_error') ?? null,
+    prs: getOpenPrs(db, repo),
+  });
+
+  return (
+    <main>
+      <h1>{vm.repo}</h1>
+      <PollStatusBanner lastPollAt={vm.lastPollAt} lastPollStatus={vm.pollStatus} lastPollError={vm.pollError} />
+      <table>
+        <thead>
+          <tr>
+            <th>PR</th>
+            <th>Title</th>
+            <th>Branch</th>
+            <th>Author</th>
+            <th>Verdict</th>
+            <th>Critical+High</th>
+            <th>Last reviewed</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {vm.rows.map((row) => (
+            // Server Components can't attach an onClick handler to the
+            // <tr> itself (that would require a Client Component), so
+            // "clicking a row navigates" is satisfied instead by making
+            // every data cell in the row a full-cell <Link> (styled to
+            // `display: block` so the whole cell area, not just the
+            // text, is clickable) - only the "Re-check now" form/button
+            // cell is excluded, since it must submit a POST rather than
+            // navigate.
+            <tr key={row.prNumber}>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  #{row.prNumber}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.title}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.branch}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.author}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.isInProgress ? 'Reviewing…' : <VerdictBadge verdict={row.badgeVerdict} />}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.criticalHighCount ?? '-'}
+                </Link>
+              </td>
+              <td>
+                <Link href={`/pr/${row.prNumber}`} style={{ display: 'block' }}>
+                  {row.lastReviewedAt ?? '-'}
+                </Link>
+              </td>
+              <td>
+                <form action={`/api/recheck/${row.prNumber}`} method="post">
+                  <button type="submit">Re-check now</button>
+                </form>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </main>
+  );
+}
+```
+
+- [ ] **Step 6: Manually verify the page renders**
+
+Run: `npm run dev`, then open `http://localhost:3000` in a browser (or
+`curl -s http://localhost:3000 | grep -o '<h1>[^<]*</h1>'`) with a
+populated database (from Chunk 4's poller having run at least once,
+writing to `$PR_DASHBOARD_DB_PATH`, default `~/.pr-review-dashboard/dashboard.sqlite`). Server Components with direct DB access aren't unit-testable
+without a real Next.js render pipeline, so this manual check is the
+verification step for `page.tsx` itself — the view model it depends on
+is already fully unit-tested above.
+Expected: page loads without error, shows the configured repo name,
+clicking anywhere in a row (not just the PR number) navigates to
+`/pr/<number>`, and each row's "Re-check now" button submits without a
+client-side error (the route itself isn't built until Chunk 7, so a 404
+response here is expected and fine for this check).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/lib/listPageViewModel.ts src/lib/listPageViewModel.test.ts src/app/page.tsx
+git commit -m "feat(ui): add list page with view model and manual verification"
+```
+
+---
+
+## Chunk 6: Next.js UI — Detail Page
+
+This chunk depends on Chunk 5 (`VerdictBadge`, `SeverityBadge` and the
+overall `app/` structure) and adds the Detail Page along with its own
+view model and the `FindingCard` component.
+
+### Task 6.1: Detail Page (`app/pr/[number]/page.tsx`) + `FindingCard`
+
+**Files:**
+- Create: `src/lib/detailPageViewModel.ts`
+- Test: `src/lib/detailPageViewModel.test.ts`
+- Create: `src/app/components/FindingCard.tsx`
+- Test: `src/app/components/FindingCard.test.tsx`
+- Create: `src/app/pr/[number]/page.tsx`
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/lib/detailPageViewModel.test.ts`:
+```typescript
+import { describe, it, expect } from 'vitest';
+import { buildDetailPageViewModel } from './detailPageViewModel';
+import type { PullRequestRow } from '../db/pullRequests';
+import type { FindingRow } from '../db/findings';
+
+function prRow(overrides: Partial<PullRequestRow>): PullRequestRow {
+  return {
+    id: 1,
+    repo: 'owner/name',
+    pr_number: 42,
+    title: 'Add feature',
+    author: 'alice',
+    branch: 'feat/x',
+    base_branch: 'main',
+    head_sha: 'abc123',
+    pr_url: 'https://github.com/owner/name/pull/42',
+    is_draft: 0,
+    pr_state: 'open',
+    review_status: 'done',
+    verdict: 'approve',
+    severity_critical: 0,
+    severity_high: 0,
+    severity_medium: 0,
+    severity_low: 0,
+    reviewed_head_sha: 'abc123',
+    last_reviewed_at: '2026-07-28T00:00:00.000Z',
+    last_attempted_at: '2026-07-28T00:00:00.000Z',
+    raw_report_md: '# report',
+    error_message: null,
+    ...overrides,
+  };
+}
+
+function findingRow(overrides: Partial<FindingRow>): FindingRow {
+  return {
+    id: 1,
+    pull_request_id: 1,
+    file: 'src/a.ts',
+    line: 10,
+    severity: 'HIGH',
+    summary: 'Missing null check',
+    failureScenario: 'Crashes when input is null',
+    evidence: 'a.ts:10',
+    fixSuggestion: 'Add a null guard',
+    codeSnippet: 'if (!x) return;',
+    ...overrides,
+  };
+}
+
+describe('buildDetailPageViewModel', () => {
+  it('shows the normal state for a done review, splitting top risks from medium/low', () => {
+    const vm = buildDetailPageViewModel(
+      prRow({}),
+      [findingRow({ severity: 'CRITICAL' }), findingRow({ severity: 'LOW', id: 2 })]
+    );
+    expect(vm.state).toBe('normal');
+    expect(vm.topRisks).toHaveLength(1);
+    expect(vm.mediumLow).toHaveLength(1);
+  });
+
+  it('shows the "failed with prior success" state and still renders prior findings', () => {
+    const vm = buildDetailPageViewModel(
+      prRow({
+        review_status: 'failed',
+        error_message: 'copilot timed out',
+        last_attempted_at: '2026-07-28T01:00:00.000Z',
+        last_reviewed_at: '2026-07-28T00:00:00.000Z',
+        reviewed_head_sha: 'abc123',
+      }),
+      [findingRow({ severity: 'CRITICAL' })]
+    );
+    expect(vm.state).toBe('failed-with-prior-success');
+    expect(vm.topRisks).toHaveLength(1);
+    expect(vm.failureBanner).toMatchObject({
+      lastAttemptedAt: '2026-07-28T01:00:00.000Z',
+      errorMessage: 'copilot timed out',
+      lastReviewedAt: '2026-07-28T00:00:00.000Z',
+      reviewedHeadSha: 'abc123',
+    });
+  });
+
+  it('shows the "failed with no prior success" state with no findings sections, even if stray findings rows exist', () => {
+    const vm = buildDetailPageViewModel(
+      prRow({
+        review_status: 'failed',
+        error_message: 'git fetch failed',
+        last_attempted_at: '2026-07-28T01:00:00.000Z',
+        last_reviewed_at: null,
+        reviewed_head_sha: null,
+        raw_report_md: '# stray leftover report',
+      }),
+      // Non-empty on purpose: this state must suppress findings/report
+      // sections regardless of what's in the DB, not just because the
+      // inputs happen to be empty.
+      [findingRow({ severity: 'CRITICAL' }), findingRow({ severity: 'LOW', id: 2 })]
+    );
+    expect(vm.state).toBe('failed-no-prior-success');
+    expect(vm.topRisks).toHaveLength(0);
+    expect(vm.mediumLow).toHaveLength(0);
+    expect(vm.rawReportMd).toBeNull();
+  });
+});
+```
+
+`src/app/components/FindingCard.test.tsx`:
+```typescript
+import { describe, it, expect } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import { FindingCard } from './FindingCard';
+
+describe('FindingCard', () => {
+  it('renders all finding fields', () => {
+    render(
+      <FindingCard
+        finding={{
+          file: 'src/a.ts',
+          line: 10,
+          severity: 'CRITICAL',
+          summary: 'Missing null check',
+          failureScenario: 'Crashes when input is null',
+          evidence: 'a.ts:10',
+          fixSuggestion: 'Add a null guard',
+          codeSnippet: 'if (!x) return;',
+        }}
+      />
+    );
+    expect(screen.getByText('Missing null check')).toBeInTheDocument();
+    expect(screen.getByText(/src\/a.ts:10/)).toBeInTheDocument();
+    expect(screen.getByText('Crashes when input is null')).toBeInTheDocument();
+    expect(screen.getByText('Add a null guard')).toBeInTheDocument();
+    expect(screen.getByText('if (!x) return;')).toBeInTheDocument();
+  });
+});
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `npm run test -- src/lib/detailPageViewModel.test.ts src/app/components/FindingCard.test.tsx`
+Expected: FAIL — modules not found.
+
+- [ ] **Step 3: Write the implementations**
+
+`src/lib/detailPageViewModel.ts`:
+```typescript
+import type { PullRequestRow } from '../db/pullRequests';
+import type { FindingRow } from '../db/findings';
+
+export type DetailPageState = 'normal' | 'failed-with-prior-success' | 'failed-no-prior-success';
+
+export interface FailureBanner {
+  lastAttemptedAt: string | null;
+  errorMessage: string | null;
+  lastReviewedAt: string | null;
+  reviewedHeadSha: string | null;
+}
+
+export interface DetailPageViewModel {
+  state: DetailPageState;
+  prNumber: number;
+  title: string;
+  verdict: string | null;
+  severityCritical: number;
+  severityHigh: number;
+  severityMedium: number;
+  severityLow: number;
+  topRisks: FindingRow[];
+  mediumLow: FindingRow[];
+  rawReportMd: string | null;
+  failureBanner: FailureBanner | null;
+}
+
+export function buildDetailPageViewModel(pr: PullRequestRow, findings: FindingRow[]): DetailPageViewModel {
+  const isFailed = pr.review_status === 'failed';
+  const hasPriorSuccess = pr.last_reviewed_at !== null;
+
+  let state: DetailPageState = 'normal';
+  if (isFailed) {
+    state = hasPriorSuccess ? 'failed-with-prior-success' : 'failed-no-prior-success';
+  }
+
+  // In the no-prior-success failed state there's nothing meaningful to
+  // show (findings/raw_report_md belong to the last *successful* review,
+  // which doesn't exist yet), so the findings/report sections are
+  // suppressed entirely per spec even though the DB columns are just
+  // empty/null naturally in that case too.
+  const showFindings = state !== 'failed-no-prior-success';
+
+  return {
+    state,
+    prNumber: pr.pr_number,
+    title: pr.title,
+    verdict: pr.verdict,
+    severityCritical: pr.severity_critical,
+    severityHigh: pr.severity_high,
+    severityMedium: pr.severity_medium,
+    severityLow: pr.severity_low,
+    topRisks: showFindings ? findings.filter((f) => f.severity === 'CRITICAL' || f.severity === 'HIGH') : [],
+    mediumLow: showFindings ? findings.filter((f) => f.severity === 'MEDIUM' || f.severity === 'LOW') : [],
+    rawReportMd: showFindings ? pr.raw_report_md : null,
+    failureBanner: isFailed
+      ? {
+          lastAttemptedAt: pr.last_attempted_at,
+          errorMessage: pr.error_message,
+          lastReviewedAt: pr.last_reviewed_at,
+          reviewedHeadSha: pr.reviewed_head_sha,
+        }
+      : null,
+  };
+}
+```
+
+`src/app/components/FindingCard.tsx`:
+```typescript
+import { SeverityBadge, type Severity } from './SeverityBadge';
+
+export interface FindingCardInput {
+  file: string;
+  line: number;
+  severity: Severity;
+  summary: string;
+  failureScenario: string;
+  evidence: string;
+  fixSuggestion: string;
+  codeSnippet: string;
+}
+
+export function FindingCard({ finding }: { finding: FindingCardInput }) {
+  return (
+    <div style={{ border: '1px solid #d0d7de', borderRadius: 6, padding: 12, marginBottom: 8 }}>
+      <div>
+        <SeverityBadge severity={finding.severity} /> <strong>{finding.summary}</strong>
+      </div>
+      <p>
+        {finding.file}:{finding.line}
+      </p>
+      <p>
+        <em>Failure scenario:</em> {finding.failureScenario}
+      </p>
+      <p>
+        <em>Evidence:</em> {finding.evidence}
+      </p>
+      <p>
+        <em>Fix:</em> {finding.fixSuggestion}
+      </p>
+      <pre>{finding.codeSnippet}</pre>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npm run test -- src/lib/detailPageViewModel.test.ts src/app/components/FindingCard.test.tsx`
+Expected: PASS, 4 tests (3 + 1).
+
+- [ ] **Step 5: Write `src/app/pr/[number]/page.tsx`**
+
+```tsx
+import { notFound } from 'next/navigation';
+import { getDb } from '../../../db/client';
+import { getConfig } from '../../../db/config';
+import { getByNumber } from '../../../db/pullRequests';
+import { getFindingsByPrId } from '../../../db/findings';
+import { buildDetailPageViewModel } from '../../../lib/detailPageViewModel';
+import { VerdictBadge } from '../../components/VerdictBadge';
+import { FindingCard } from '../../components/FindingCard';
+
+export const dynamic = 'force-dynamic';
+
+export default function DetailPage({ params }: { params: { number: string } }) {
+  const db = getDb();
+  const repo = getConfig(db, 'target_repo') ?? '(not configured)';
+  const prNumber = Number(params.number);
+  const pr = getByNumber(db, repo, prNumber);
+  if (!pr) {
+    notFound();
+  }
+
+  const findings = getFindingsByPrId(db, pr.id);
+  const vm = buildDetailPageViewModel(pr, findings);
+
+  return (
+    <main>
+      <h1>
+        #{vm.prNumber} {vm.title}
+      </h1>
+      <form action={`/api/recheck/${vm.prNumber}`} method="post">
+        <button type="submit">Re-check now</button>
+      </form>
+
+      {vm.failureBanner && vm.state === 'failed-with-prior-success' && (
+        <div role="alert">
+          ⚠ Latest re-check failed at {vm.failureBanner.lastAttemptedAt}: {vm.failureBanner.errorMessage}. Showing
+          results from the last successful review ({vm.failureBanner.lastReviewedAt}, commit{' '}
+          {vm.failureBanner.reviewedHeadSha}).
+        </div>
+      )}
+
+      {vm.failureBanner && vm.state === 'failed-no-prior-success' && (
+        <div role="alert">
+          Review failed at {vm.failureBanner.lastAttemptedAt}: {vm.failureBanner.errorMessage}. No successful review
+          yet.
+        </div>
+      )}
+
+      {vm.state !== 'failed-no-prior-success' && (
+        <>
+          <section>
+            <h2>Executive Summary</h2>
+            {vm.verdict && <VerdictBadge verdict={vm.verdict as 'approve' | 'needs_fix' | 'needs_review'} />}
+            <p>
+              Critical: {vm.severityCritical}, High: {vm.severityHigh}, Medium: {vm.severityMedium}, Low:{' '}
+              {vm.severityLow}
+            </p>
+          </section>
+
+          <section>
+            <h2>Top Risks</h2>
+            {vm.topRisks.map((f) => (
+              <FindingCard key={f.id} finding={f} />
+            ))}
+          </section>
+
+          <section>
+            <h2>Medium/Low</h2>
+            <ul>
+              {vm.mediumLow.map((f) => (
+                <li key={f.id}>
+                  {f.severity}: {f.summary} ({f.file}:{f.line})
+                </li>
+              ))}
+            </ul>
+          </section>
+
+          {vm.rawReportMd && (
+            <details>
+              <summary>Raw report</summary>
+              <pre>{vm.rawReportMd}</pre>
+            </details>
+          )}
+        </>
+      )}
+    </main>
+  );
+}
+```
+
+- [ ] **Step 6: Manually verify the page renders both normal and failed states**
+
+The app's real database path is `$PR_DASHBOARD_DB_PATH`, defaulting to
+`~/.pr-review-dashboard/dashboard.sqlite` (see `getDb()` in Chunk 1) —
+**not** `data/dashboard.db`. It runs in WAL mode, so a plain `cp` of the
+main file can miss in-flight writes recorded in the `-wal`/`-shm`
+sidecar files and produce a corrupt or stale backup/restore. Resolve the
+real path once and use `sqlite3`'s own `.backup`/`.restore` commands
+(which checkpoint the WAL correctly) instead of `cp`:
+
+```bash
+DB="${PR_DASHBOARD_DB_PATH:-$HOME/.pr-review-dashboard/dashboard.sqlite}"
+echo "$DB"
+```
+
+**Stop `npm run dev` before backing up** (a live connection can hold WAL
+state that a snapshot outside `sqlite3` won't see) — start it again only
+after the backup completes:
+```bash
+sqlite3 "$DB" ".backup /tmp/dashboard.db.bak"
+npm run dev
+```
+
+Then pick a real PR number to test against:
+```bash
+sqlite3 "$DB" "SELECT pr_number, review_status, last_reviewed_at FROM pull_requests WHERE pr_state='open' AND is_draft=0"
+```
+Pick one row with `review_status='done'` (a PR that reviewed
+successfully) and note its `pr_number` — call it `<n>` below.
+
+Visit `http://localhost:3000/pr/<n>` (substituting the real number) and
+confirm the normal state renders Executive Summary/Top Risks/Medium-Low/
+raw report. Then force each of the two distinct failed states in turn,
+reloading `/pr/<n>` after each `sqlite3` command below (substituting the
+same real PR number for `<n>` in both the SQL and the URL):
+
+1. **failed-with-prior-success** (this same PR, which just succeeded, now
+   has a later re-check fail — `last_reviewed_at` stays set from the
+   prior success):
+   ```bash
+   sqlite3 "$DB" "UPDATE pull_requests SET review_status='failed', error_message='manual test: timeout', last_attempted_at=datetime('now') WHERE pr_number=<n>"
+   ```
+   Expected: the "⚠ Latest re-check failed..." banner appears above a
+   fully rendered Executive Summary/Top Risks/Medium-Low/raw report
+   (the prior successful review's data, unchanged from before this
+   `UPDATE`).
+
+2. **failed-no-prior-success** (same PR, now simulating that it never
+   succeeded at all):
+   ```bash
+   sqlite3 "$DB" "UPDATE pull_requests SET review_status='failed', error_message='manual test: git fetch failed', last_attempted_at=datetime('now'), last_reviewed_at=NULL, reviewed_head_sha=NULL WHERE pr_number=<n>"
+   ```
+   Expected: only the "Review failed... No successful review yet." banner
+   appears; no Executive Summary/Top Risks/Medium-Low/raw report sections
+   are rendered.
+
+Restore the database afterwards so Chunk 7's manual verification and any
+further local testing start from real data again. **Stop `npm run dev`
+first**, restore via `.restore` (which correctly replaces any WAL state
+too), then restart:
+```bash
+# stop npm run dev
+sqlite3 "$DB" ".restore /tmp/dashboard.db.bak"
+npm run dev
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/lib/detailPageViewModel.ts src/lib/detailPageViewModel.test.ts src/app/components/FindingCard.tsx src/app/components/FindingCard.test.tsx src/app/pr/\[number\]/page.tsx
+git commit -m "feat(ui): add detail page with normal/failed view model states"
+```
+
+---
+
+## Chunk 7: Re-check API route + final verification
+
+This chunk covers the "Re-check now" button's backend and the
+end-to-end manual verification pass. It depends on everything in
+Chunks 1-6 (the List Page in Chunk 5 and the Detail Page in Chunk 6 both
+link to the API route this chunk builds).
+
+### Task 7.1: "Re-check now" — `forceRecheck` + API route
+
+**Files:**
+- Modify: `src/lib/poller.ts:2591` (export `processOnePr` instead of leaving it module-private)
+- Create: `src/lib/recheck.ts`
+- Test: `src/lib/recheck.test.ts`
+- Create: `src/app/api/recheck/[number]/route.ts`
+- Test: `src/app/api/recheck/[number]/route.test.ts`
+
+`forceRecheck()` is the shared logic behind the "Re-check now" button on
+both pages. Per the design spec, it must: (1) respect the single-flight
+rule — no-op if the PR is already `pending`/`reviewing`; (2) fetch the
+PR's current `head_sha` from GitHub first (read-only `gh pr list`, same
+as the poller — no writes to the remote), so the forced run reviews the
+PR's actual current code rather than a stale cached `head_sha`; (3)
+bypass `decidePrAction()`'s "new or head_sha changed" gate entirely,
+since this is an explicit user request, not a routine poll decision.
+
+- [ ] **Step 1: Export `processOnePr` from `poller.ts`**
+
+Change the module-private declaration:
+```typescript
+async function processOnePr(
+```
+to:
+```typescript
+export async function processOnePr(
+```
+
+This is a pure visibility change — no behavior differs. Run the
+existing suite to confirm nothing broke before continuing:
+
+Run: `npm run test -- src/lib/poller.test.ts`
+Expected: PASS, 7 tests (unchanged from Chunk 4).
+
+- [ ] **Step 2: Write the failing tests for `forceRecheck`**
+
+`src/lib/recheck.test.ts`:
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const fetchOpenPrsMock = vi.fn();
+vi.mock('./gh', () => ({ fetchOpenPrs: (...args: unknown[]) => fetchOpenPrsMock(...args) }));
+
+const processOnePrMock = vi.fn().mockResolvedValue(undefined);
+vi.mock('./poller', () => ({ processOnePr: (...args: unknown[]) => processOnePrMock(...args) }));
+
+// Mirrors the real withPollLock's actual contract: when `skipNext` is
+// true (simulating a scheduled poll tick already holding the mutex), it
+// resolves to 'skipped' WITHOUT ever invoking `fn` - matching queue.ts's
+// real `if (isPollInProgress()) return 'skipped';` short-circuit. This
+// is what lets the "already running" test below exercise the real
+// synchronous-dispatch-detection logic in `forceRecheck`, rather than
+// just asserting on a separately-mocked `isPollInProgress()` call.
+let skipNext = false;
+const withPollLockMock = vi.fn((fn: () => Promise<unknown>) => {
+  if (skipNext) return Promise.resolve('skipped');
+  return fn();
+});
+vi.mock('./queue', () => ({ withPollLock: (...args: unknown[]) => withPollLockMock(...args) }));
+
+const { forceRecheck } = await import('./recheck');
+const { createTestDb } = await import('../db/client');
+const { upsertOpenPr } = await import('../db/pullRequests');
+
+describe('forceRecheck', () => {
+  let db: ReturnType<typeof createTestDb>;
+
+  beforeEach(() => {
+    db = createTestDb();
+    fetchOpenPrsMock.mockReset();
+    processOnePrMock.mockClear();
+    skipNext = false;
+    withPollLockMock.mockClear();
+  });
+
+  it('returns not-found when the PR is not tracked at all', async () => {
+    const result = await forceRecheck(db, 'owner/name', 999);
+    expect(result).toEqual({ status: 'not-found' });
+    expect(fetchOpenPrsMock).not.toHaveBeenCalled();
+  });
+
+  it('returns already-in-progress and does not re-enqueue when review_status is pending', async () => {
+    upsertOpenPr(db, {
+      repo: 'owner/name', prNumber: 1, title: 't', author: 'a', branch: 'b',
+      baseBranch: 'main', headSha: 'sha1', prUrl: 'u', isDraft: false,
+    });
+    const result = await forceRecheck(db, 'owner/name', 1);
+    expect(result).toEqual({ status: 'already-in-progress' });
+    expect(fetchOpenPrsMock).not.toHaveBeenCalled();
+  });
+
+  it('returns not-found when the PR is no longer in the fresh gh pr list (closed/merged)', async () => {
+    upsertOpenPr(db, {
+      repo: 'owner/name', prNumber: 1, title: 't', author: 'a', branch: 'b',
+      baseBranch: 'main', headSha: 'sha1', prUrl: 'u', isDraft: false,
+    });
+    db.prepare("UPDATE pull_requests SET review_status = 'done' WHERE pr_number = 1").run();
+    fetchOpenPrsMock.mockResolvedValue([]);
+    const result = await forceRecheck(db, 'owner/name', 1);
+    expect(result).toEqual({ status: 'not-found' });
+  });
+
+  it('returns error when gh pr list fails', async () => {
+    upsertOpenPr(db, {
+      repo: 'owner/name', prNumber: 1, title: 't', author: 'a', branch: 'b',
+      baseBranch: 'main', headSha: 'sha1', prUrl: 'u', isDraft: false,
+    });
+    db.prepare("UPDATE pull_requests SET review_status = 'done' WHERE pr_number = 1").run();
+    fetchOpenPrsMock.mockRejectedValue(new Error('gh: authentication required'));
+    const result = await forceRecheck(db, 'owner/name', 1);
+    expect(result).toEqual({ status: 'error', message: 'gh: authentication required' });
+  });
+
+  it('refreshes metadata, marks pending, and kicks off processOnePr under the poll lock on success', async () => {
+    upsertOpenPr(db, {
+      repo: 'owner/name', prNumber: 1, title: 'old title', author: 'a', branch: 'b',
+      baseBranch: 'main', headSha: 'sha1', prUrl: 'u', isDraft: false,
+    });
+    db.prepare("UPDATE pull_requests SET review_status = 'failed' WHERE pr_number = 1").run();
+    fetchOpenPrsMock.mockResolvedValue([
+      { number: 1, title: 'new title', author: 'a', headRefName: 'b', baseRefName: 'main', headRefOid: 'sha2', url: 'u', isDraft: false },
+    ]);
+
+    const result = await forceRecheck(db, 'owner/name', 1);
+
+    expect(result).toEqual({ status: 'started' });
+    const row = db.prepare('SELECT * FROM pull_requests WHERE pr_number = 1').get() as { title: string; head_sha: string; review_status: string };
+    expect(row.title).toBe('new title');
+    expect(row.head_sha).toBe('sha2');
+    expect(row.review_status).toBe('pending');
+    expect(withPollLockMock).toHaveBeenCalledTimes(1);
+    expect(processOnePrMock).toHaveBeenCalledWith(db, 'owner/name', expect.any(Number), 1, 'new title', 'b', 'main', 'sha2');
+  });
+
+  it('still refreshes metadata and marks pending, but reports queued (not started) when a scheduled poll tick already holds the mutex', async () => {
+    upsertOpenPr(db, {
+      repo: 'owner/name', prNumber: 1, title: 'old title', author: 'a', branch: 'b',
+      baseBranch: 'main', headSha: 'sha1', prUrl: 'u', isDraft: false,
+    });
+    db.prepare("UPDATE pull_requests SET review_status = 'failed' WHERE pr_number = 1").run();
+    fetchOpenPrsMock.mockResolvedValue([
+      { number: 1, title: 'new title', author: 'a', headRefName: 'b', baseRefName: 'main', headRefOid: 'sha2', url: 'u', isDraft: false },
+    ]);
+    skipNext = true;
+
+    const result = await forceRecheck(db, 'owner/name', 1);
+
+    // A concurrently-running scheduled poll tick already holds the
+    // mutex, so withPollLockMock resolves 'skipped' without ever
+    // invoking processOnePr. The row is still guaranteed to be reviewed
+    // eventually - getPendingPrs() (poller.ts) picks up any
+    // review_status='pending' row on the next scheduled tick, regardless
+    // of how it got set to 'pending' - but reporting 'started' here
+    // would be misleading, since no processOnePr call was actually
+    // dispatched this time.
+    expect(result).toEqual({
+      status: 'queued',
+      message: 'A poll tick is already running; this PR will be reviewed automatically on the current or next poll cycle.',
+    });
+    const row = db.prepare('SELECT * FROM pull_requests WHERE pr_number = 1').get() as { review_status: string };
+    expect(row.review_status).toBe('pending');
+    expect(withPollLockMock).toHaveBeenCalledTimes(1);
+    expect(processOnePrMock).not.toHaveBeenCalled();
+  });
+});
+```
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Run: `npm run test -- src/lib/recheck.test.ts`
+Expected: FAIL — `Cannot find module './recheck'`.
+
+- [ ] **Step 4: Write `src/lib/recheck.ts`**
+
+```typescript
+import type Database from 'better-sqlite3';
+import { getByNumber, markPending, upsertOpenPr } from '../db/pullRequests';
+import { fetchOpenPrs } from './gh';
+import { withPollLock } from './queue';
+import { processOnePr } from './poller';
+
+export type RecheckOutcome =
+  | { status: 'started' }
+  | { status: 'queued'; message: string }
+  | { status: 'already-in-progress' }
+  | { status: 'not-found' }
+  | { status: 'error'; message: string };
+
+export async function forceRecheck(
+  db: Database.Database,
+  repo: string,
+  prNumber: number
+): Promise<RecheckOutcome> {
+  const existing = getByNumber(db, repo, prNumber);
+  if (!existing) return { status: 'not-found' };
+  if (existing.review_status === 'pending' || existing.review_status === 'reviewing') {
+    return { status: 'already-in-progress' };
+  }
+
+  let freshPrs;
+  try {
+    freshPrs = await fetchOpenPrs(repo);
+  } catch (err) {
+    return { status: 'error', message: err instanceof Error ? err.message : String(err) };
+  }
+
+  const fresh = freshPrs.find((p) => p.number === prNumber);
+  if (!fresh) return { status: 'not-found' }; // closed/merged since the last poll
+
+  upsertOpenPr(db, {
+    repo,
+    prNumber: fresh.number,
+    title: fresh.title,
+    author: fresh.author,
+    branch: fresh.headRefName,
+    baseBranch: fresh.baseRefName,
+    headSha: fresh.headRefOid,
+    prUrl: fresh.url,
+    isDraft: fresh.isDraft,
+  });
+
+  const row = getByNumber(db, repo, prNumber);
+  if (!row) return { status: 'not-found' };
+
+  // Bypass decidePrAction()'s gate entirely - this is an explicit user
+  // request, not a routine "did head_sha change" poll decision. Marking
+  // pending here is unconditional and safe regardless of what happens
+  // next: getPendingPrs() (poller.ts) reads any review_status='pending'
+  // row on its next scheduled tick, no matter how it got set to
+  // 'pending', so this row is now guaranteed to be reviewed eventually
+  // even in the worst case below.
+  markPending(db, row.id);
+
+  // Whether withPollLock() actually dispatches processOnePr (vs skipping
+  // because a scheduled poll tick already holds the mutex) is decided
+  // *synchronously* inside withPollLock/queue.ts's `isPollInProgress()`
+  // check, before its own internal `await fn()` ever yields control.
+  // Setting `dispatched = true` as the very first line of the callback
+  // below - itself an async function that also runs synchronously up to
+  // its own first `await` - means `dispatched` is already correct by the
+  // time the `withPollLock(...)` call expression finishes evaluating (no
+  // `await` of our own happens in between). This avoids a separate
+  // up-front `isPollInProgress()` check, which would leave a race window
+  // between that check and this call for a poll tick to start in.
+  let dispatched = false;
+  const lockPromise = withPollLock(async () => {
+    dispatched = true;
+    await processOnePr(db, repo, row.id, row.pr_number, row.title, row.branch, row.base_branch, row.head_sha);
+  });
+
+  if (!dispatched) {
+    // A scheduled poll tick already holds the mutex. The row is still
+    // guaranteed to be reviewed eventually - getPendingPrs() (poller.ts)
+    // picks up any review_status='pending' row on the next scheduled
+    // tick, regardless of how it got set to 'pending' - just not via
+    // this call, so reporting 'started' here would be misleading.
+    return {
+      status: 'queued',
+      message: 'A poll tick is already running; this PR will be reviewed automatically on the current or next poll cycle.',
+    };
+  }
+
+  // Fire-and-forget: the actual review can take up to REVIEW_TIMEOUT_MS
+  // (10 minutes in poller.ts), far longer than an HTTP request should
+  // block for. The caller just needs to know the request was accepted;
+  // review_status transitions through 'reviewing' -> 'done'/'failed' are
+  // visible on the next page load, same as with a scheduled poll tick.
+  void lockPromise;
+
+  return { status: 'started' };
+}
+```
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `npm run test -- src/lib/recheck.test.ts`
+Expected: PASS, 6 tests.
+
+- [ ] **Step 6: Write the failing test for the API route**
+
+`src/app/api/recheck/[number]/route.test.ts`:
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const getDbMock = vi.fn();
+vi.mock('../../../../db/client', () => ({ getDb: () => getDbMock() }));
+
+const getConfigMock = vi.fn();
+vi.mock('../../../../db/config', () => ({ getConfig: (...args: unknown[]) => getConfigMock(...args) }));
+
+const forceRecheckMock = vi.fn();
+vi.mock('../../../../lib/recheck', () => ({ forceRecheck: (...args: unknown[]) => forceRecheckMock(...args) }));
+
+const { POST } = await import('./route');
+
+describe('POST /api/recheck/[number]', () => {
+  const dbStub = {};
+
+  beforeEach(() => {
+    getDbMock.mockReturnValue(dbStub);
+    getConfigMock.mockReset();
+    forceRecheckMock.mockReset();
+  });
+
+  it('returns 500 when target_repo is not configured', async () => {
+    getConfigMock.mockReturnValue(undefined);
+    const res = await POST(new Request('http://localhost/api/recheck/1', { method: 'POST' }), { params: { number: '1' } });
+    expect(res.status).toBe(500);
+  });
+
+  it('returns 400 for a non-numeric PR number', async () => {
+    getConfigMock.mockReturnValue('owner/name');
+    const res = await POST(new Request('http://localhost/api/recheck/abc', { method: 'POST' }), { params: { number: 'abc' } });
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 202 when forceRecheck starts a review', async () => {
+    getConfigMock.mockReturnValue('owner/name');
+    forceRecheckMock.mockResolvedValue({ status: 'started' });
+    const res = await POST(new Request('http://localhost/api/recheck/1', { method: 'POST' }), { params: { number: '1' } });
+    expect(res.status).toBe(202);
+    expect(forceRecheckMock).toHaveBeenCalledWith(dbStub, 'owner/name', 1);
+  });
+
+  it('returns 202 with a queued message when a scheduled poll tick is already running', async () => {
+    getConfigMock.mockReturnValue('owner/name');
+    const queuedMessage = 'A poll tick is already running; this PR will be reviewed automatically on the current or next poll cycle.';
+    forceRecheckMock.mockResolvedValue({ status: 'queued', message: queuedMessage });
+    const res = await POST(new Request('http://localhost/api/recheck/1', { method: 'POST' }), { params: { number: '1' } });
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body.status).toBe('queued');
+    expect(body.message).toBe(queuedMessage);
+  });
+
+  it('returns 409 when a review is already in progress', async () => {
+    getConfigMock.mockReturnValue('owner/name');
+    forceRecheckMock.mockResolvedValue({ status: 'already-in-progress' });
+    const res = await POST(new Request('http://localhost/api/recheck/1', { method: 'POST' }), { params: { number: '1' } });
+    expect(res.status).toBe(409);
+  });
+
+  it('returns 404 when the PR is not found', async () => {
+    getConfigMock.mockReturnValue('owner/name');
+    forceRecheckMock.mockResolvedValue({ status: 'not-found' });
+    const res = await POST(new Request('http://localhost/api/recheck/1', { method: 'POST' }), { params: { number: '1' } });
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 502 when fetching fresh PR data fails', async () => {
+    getConfigMock.mockReturnValue('owner/name');
+    forceRecheckMock.mockResolvedValue({ status: 'error', message: 'gh: authentication required' });
+    const res = await POST(new Request('http://localhost/api/recheck/1', { method: 'POST' }), { params: { number: '1' } });
+    expect(res.status).toBe(502);
+  });
+});
+```
+
+- [ ] **Step 7: Run test to verify it fails**
+
+Run: `npm run test -- src/app/api/recheck/\[number\]/route.test.ts`
+Expected: FAIL — `Cannot find module './route'`.
+
+- [ ] **Step 8: Write `src/app/api/recheck/[number]/route.ts`**
+
+```typescript
+import { NextResponse } from 'next/server';
+import { getDb } from '../../../../db/client';
+import { getConfig } from '../../../../db/config';
+import { forceRecheck } from '../../../../lib/recheck';
+
+export async function POST(_request: Request, { params }: { params: { number: string } }) {
+  const db = getDb();
+  const repo = getConfig(db, 'target_repo');
+  if (!repo) {
+    return NextResponse.json({ error: 'target_repo is not configured' }, { status: 500 });
+  }
+
+  const prNumber = Number(params.number);
+  if (!Number.isInteger(prNumber)) {
+    return NextResponse.json({ error: 'invalid PR number' }, { status: 400 });
+  }
+
+  const outcome = await forceRecheck(db, repo, prNumber);
+  switch (outcome.status) {
+    case 'started':
+      return NextResponse.json({ status: 'started' }, { status: 202 });
+    case 'queued':
+      return NextResponse.json({ status: 'queued', message: outcome.message }, { status: 202 });
+    case 'already-in-progress':
+      return NextResponse.json({ status: 'already-in-progress' }, { status: 409 });
+    case 'not-found':
+      return NextResponse.json({ error: 'PR not found or no longer open' }, { status: 404 });
+    case 'error':
+      return NextResponse.json({ error: outcome.message }, { status: 502 });
+  }
+}
+```
+
+- [ ] **Step 9: Run test to verify it passes**
+
+Run: `npm run test -- src/app/api/recheck/\[number\]/route.test.ts`
+Expected: PASS, 7 tests.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/lib/poller.ts src/lib/recheck.ts src/lib/recheck.test.ts src/app/api/recheck/\[number\]/route.ts src/app/api/recheck/\[number\]/route.test.ts
+git commit -m "feat(ui): add force-recheck API route with single-flight and fresh head_sha fetch"
+```
+
+---
+
+### Task 7.2: Full chunk test run
+
+**Files:** None (verification only).
+
+- [ ] **Step 1: Run the entire test suite**
+
+Run: `npm run test`
+Expected: PASS. Running total across all 7 chunks: 71 (Chunks 1-4) + 8
+(VerdictBadge/SeverityBadge) + 6 (listPageViewModel) + 2
+(PollStatusBanner) + 4 (detailPageViewModel is 3, FindingCard is 1) + 6
+(recheck) + 7 (route) = **104 tests total**. (Recount precisely from
+actual test runner output — this is an approximate running total for
+sanity-checking, not a hard assertion.)
+
+- [ ] **Step 2: Manually verify the end-to-end flow once**
+
+With `TARGET_REPO` set to a real repo you have `gh` access to:
+```bash
+npm run dev
+```
+Then in a browser:
+1. Visit `/` and confirm the repo name, poll status, and PR table render.
+2. Click into a PR's detail page and confirm Executive Summary / Top
+   Risks / Medium-Low / raw report render for a PR that has already been
+   reviewed by the Chunk 4 poller.
+3. Click "Re-check now" and confirm the row's `review_status` flips to
+   `reviewing` (visible on the next page reload) and eventually resolves
+   to `done`/`failed`.
+
+Expected: no console/server errors; the PR that was re-checked ends up
+with an updated `last_attempted_at` (and `last_reviewed_at`/findings if
+the review succeeds).
+
+- [ ] **Step 3: Commit** (only if Step 2 required any fixes; otherwise
+skip — this task is verification-only)
+
