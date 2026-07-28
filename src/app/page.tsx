@@ -24,7 +24,7 @@ export default function ListPage() {
   return (
     <main className="mx-auto flex max-w-4xl flex-col gap-6 px-6 py-10">
       <div>
-        <h1 className="text-2xl font-semibold text-[#FAFAFA]">{vm.repo}</h1>
+        <h1 className="text-2xl font-semibold text-foreground">{vm.repo}</h1>
         <div className="mt-3">
           <PollStatusBanner lastPollAt={vm.lastPollAt} lastPollStatus={vm.pollStatus} lastPollError={vm.pollError} />
         </div>
@@ -34,7 +34,7 @@ export default function ListPage() {
         {vm.rows.map((row) => (
           <Card
             key={row.prNumber}
-            className={`relative flex flex-col items-stretch gap-3 border-[#27272A] bg-[#18181B] p-4 transition-colors duration-200 ease-out hover:border-[#3B82F6]/40 sm:flex-row sm:items-center sm:justify-between ${
+            className={`relative flex flex-col items-stretch gap-3 card-glass p-4 transition-colors duration-200 ease-out hover:border-primary/40 sm:flex-row sm:items-center sm:justify-between ${
               row.isInProgress ? 'opacity-70' : ''
             }`}
           >
@@ -59,7 +59,7 @@ export default function ListPage() {
                 full card for every other click target. */}
             <Link
               href={`/pr/${row.prNumber}`}
-              className="absolute inset-0 z-0 rounded-[inherit] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3B82F6]"
+              className="absolute inset-0 z-0 rounded-[inherit] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
             >
               <span className="sr-only">
                 View PR #{row.prNumber}: {row.title}
@@ -70,7 +70,7 @@ export default function ListPage() {
               <div className="flex flex-col gap-1">
                 <div className="flex items-center gap-2">
                   <span className="font-mono text-sm text-muted-foreground">#{row.prNumber}</span>
-                  <span className="font-medium text-[#FAFAFA]">{row.title}</span>
+                  <span className="font-medium text-foreground">{row.title}</span>
                 </div>
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                   <span className="font-mono">{row.branch}</span>
@@ -82,7 +82,7 @@ export default function ListPage() {
               <div className="flex items-center gap-4">
                 {row.isInProgress ? (
                   <span className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <span className="h-2 w-2 animate-pulse rounded-full bg-[#3B82F6]" />
+                    <span className="h-2 w-2 animate-pulse rounded-full bg-primary" />
                     Reviewing…
                   </span>
                 ) : (
