@@ -14,6 +14,14 @@ preference, but the product itself targets English-speaking developers.
 ## Goals
 
 - Monitor a single, user-configured `owner/repo` for open, non-draft PRs.
+  Configuration source: a `TARGET_REPO=owner/name` environment variable
+  (via `.env.local`), read once at process startup. On first read, its
+  value is upserted into the `config` table (`key='target_repo'`) purely so
+  the UI header can display it without re-reading the environment; the env
+  var remains the source of truth for v1 (no in-app config editing UI). If
+  `TARGET_REPO` is unset or malformed (not `owner/name`) at startup, the
+  process logs a fatal error and exits immediately rather than starting the
+  dashboard in a half-configured state.
 - Poll every 5 minutes via the `gh` CLI (no public ingress required).
 - Automatically (re-)review a PR when it is first seen, or when its
   `head_sha` changes (new commits pushed).
@@ -48,16 +56,43 @@ preference, but the product itself targets English-speaking developers.
   `register()` hook registers a cron job that runs every 5 minutes.
 - **Data flow**:
   1. Cron job runs `gh pr list --repo <owner/repo> --state open --json
-     number,title,author,headRefName,headRefOid` (drafts excluded by
-     default in this query, but the implementation must also explicitly
-     filter `isDraft=false` since `gh pr list --state open` includes
-     drafts).
-  2. Compare results against the `pull_requests` table: a PR is new, or its
-     `head_sha` differs from `reviewed_head_sha` → enqueue for review.
-  3. The queue is processed in-process, serially (avoid contention on the
-     local machine). Each queued PR:
-     - `git fetch` + checkout (via `git worktree add`) the PR branch into a
-       local cache directory: `~/.pr-review-dashboard/repos/<owner>__<repo>`.
+     number,title,author,headRefName,headRefOid,baseRefName,isDraft,url`.
+     `--state open` includes drafts, so the poller explicitly filters out
+     any result with `isDraft=true` after fetching (rather than relying on
+     an unsupported `gh` flag). `baseRefName` is retained so the review
+     step can diff the PR branch against the correct base, and `url` is
+     stored as `pr_url` for linking out to GitHub from the UI.
+  2. Compare results against the `pull_requests` table:
+     - A PR is new, or its `head_sha` differs from `reviewed_head_sha` →
+       upsert a row (creating it with `review_status='pending'` if new)
+       and add it to this tick's in-memory processing queue.
+     - A previously tracked PR that no longer appears in the open-PR list
+       (closed or merged) is marked `pr_state='closed'` in the
+       `pull_requests` table; its row and last review are kept for
+       reference, but the List Page's default view filters to
+       `pr_state='open'` only.
+     Update the `config` row `key='last_poll_at'` with the current
+     timestamp on every poll tick (success or partial failure), so the
+     List Page header can display it.
+  3. The queue built in step 2 is processed in-process, one PR at a time
+     (a PR sits in `review_status='pending'` from the moment it's enqueued
+     until its turn comes up later in the same tick, which may take a
+     while if several PRs changed at once). Repo caching/worktree layout:
+     - A single bare/mirror clone per target repo lives at
+       `~/.pr-review-dashboard/repos/<owner>__<repo>/repo.git` (created via
+       `git clone --bare` on first use, then `git fetch` on each poll).
+     - Each PR gets its own worktree at
+       `~/.pr-review-dashboard/repos/<owner>__<repo>/worktrees/pr-<number>`,
+       created with `git worktree add <path> <head_sha>` (or
+       `git worktree add --force` re-pointed to the new `head_sha` when
+       re-reviewing) from the bare repo. The base branch is fetched into
+       the same bare repo, so `git diff <baseRefName>...<head_sha>` can be
+       computed from within the worktree without a separate checkout.
+     - Before enqueuing, if the PR's current `review_status='reviewing'`
+       (from a still-running job), skip re-enqueuing it this tick — this
+       also applies to the manual "Re-check now"/"Retry" action, which is
+       a no-op (surfaced to the user) if a review for that PR is already
+       in flight.
      - Mark `review_status = 'reviewing'` in the DB immediately so the UI
        reflects in-progress state.
      - Spawn `copilot -p "<prompt>"` headless in the worktree directory. The
@@ -87,7 +122,7 @@ preference, but the product itself targets English-speaking developers.
 CREATE TABLE config (
   key TEXT PRIMARY KEY,
   value TEXT
-); -- e.g. ('target_repo', 'owner/name')
+); -- e.g. ('target_repo', 'owner/name'), ('last_poll_at', ISO timestamp)
 
 CREATE TABLE pull_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,9 +131,17 @@ CREATE TABLE pull_requests (
   title TEXT,
   author TEXT,
   branch TEXT,
+  base_branch TEXT,
   head_sha TEXT,
-  pr_url TEXT,
+  pr_url TEXT,             -- link to the PR on GitHub, shown on both pages
+  pr_state TEXT DEFAULT 'open', -- 'open' | 'closed' (closed = merged or
+                                 -- closed upstream, no longer in the open-PR
+                                 -- poll result; row/review data retained)
   review_status TEXT,      -- 'pending' | 'reviewing' | 'done' | 'failed'
+                            -- pending = enqueued, not yet started;
+                            -- reviewing = worktree/copilot run in progress;
+                            -- done/failed = terminal states until next
+                            -- head_sha change or manual re-check
   verdict TEXT,            -- 'approve' | 'needs_fix' | 'needs_review' | NULL
   severity_critical INTEGER DEFAULT 0,
   severity_high INTEGER DEFAULT 0,
@@ -131,11 +174,13 @@ new set, and `pull_requests` fields are overwritten in place.
 
 ## Pages & Components
 
-- **List Page (`/`)**: Server Component querying `pull_requests`. Table
+- **List Page (`/`)**: Server Component querying `pull_requests` filtered to
+  `pr_state='open'` by default. Table
   columns: PR number, title, branch, author, last reviewed time, verdict
   badge, CRITICAL+HIGH count. Rows in `review_status='reviewing'` show an
-  in-progress indicator. Header shows the configured repo and last poll
-  time. Clicking a row navigates to `/pr/[number]`.
+  in-progress indicator. Header shows the configured repo
+  (`config.target_repo`) and last poll time (`config.last_poll_at`).
+  Clicking a row navigates to `/pr/[number]`.
 - **Detail Page (`/pr/[number]`)**:
   - Executive Summary (verdict + severity counts).
   - Top Risks (CRITICAL/HIGH), each with: summary, failure scenario,
@@ -156,9 +201,18 @@ new set, and `pull_requests` fields are overwritten in place.
 - `copilot -p` timeout (e.g., 10 minutes) or non-zero exit: mark
   `review_status='failed'`; previous successful review data is preserved
   rather than overwritten.
-- Structured JSON block missing/malformed in the copilot output: still
-  persist `raw_report_md` in full; leave `findings` empty and set
-  `verdict='needs_review'` so a human can read the raw report.
+- Structured JSON block missing/malformed in the copilot output: this is
+  treated as a *successful* review that completed without full structured
+  data, not a failure — `review_status` still advances to `'done'`,
+  `reviewed_head_sha` and `last_reviewed_at` update normally (so it won't
+  be endlessly retried on the same `head_sha`), and `raw_report_md` is
+  persisted in full. Only `findings` is left empty and `verdict` is set to
+  `'needs_review'` so a human knows to read the raw report. This is
+  distinct from `review_status='failed'`, which is reserved for cases
+  where the review did not produce usable output at all (fetch/checkout
+  error, spawn error, timeout, non-zero exit) — in those cases
+  `reviewed_head_sha`/`last_reviewed_at` are *not* updated, so the PR is
+  retried on the next poll tick.
 
 ## Testing Strategy
 
