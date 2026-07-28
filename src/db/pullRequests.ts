@@ -111,6 +111,20 @@ export function getByNumber(
     .get(repo, prNumber) as PullRequestRow | undefined;
 }
 
+// Excludes drafts: a draft PR's row can sit at review_status='pending'
+// indefinitely (upsertOpenPr's insert default, see Chunk 1), but drafts
+// are never actually supposed to be reviewed or shown — this is the
+// query the poller's queue-processing loop uses, so it must filter them
+// out here rather than relying on callers to remember to do so.
+export function getPendingPrs(db: Database.Database, repo: string): PullRequestRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM pull_requests WHERE repo = ? AND review_status = 'pending' AND is_draft = 0
+       ORDER BY id ASC`
+    )
+    .all(repo) as PullRequestRow[];
+}
+
 export function markReviewing(db: Database.Database, id: number): void {
   db.prepare("UPDATE pull_requests SET review_status = 'reviewing' WHERE id = ?").run(id);
 }

@@ -10,6 +10,7 @@ import {
   markPending,
   getOpenPrs,
   getByNumber,
+  getPendingPrs,
   resetStuckReviews,
   type OpenPrInput,
 } from './pullRequests';
@@ -204,5 +205,18 @@ describe('pullRequests repository', () => {
     expect(pending.verdict).toBe('approve'); // preserved until new review completes
     expect(pending.reviewed_head_sha).toBe('sha1'); // preserved
     expect(pending.raw_report_md).toBe('# ok'); // preserved
+  });
+
+  it('getPendingPrs returns only pending, non-draft rows for the given repo, oldest first', () => {
+    upsertOpenPr(db, basePr); // pending
+    upsertOpenPr(db, { ...basePr, prNumber: 2 });
+    markReviewing(db, getByNumber(db, 'owner/name', 2)!.id); // not pending anymore
+    upsertOpenPr(db, { ...basePr, prNumber: 3 }); // pending
+    upsertOpenPr(db, { ...basePr, prNumber: 4, isDraft: true }); // pending but a draft — never queued
+    upsertOpenPr(db, { ...basePr, repo: 'other/repo', prNumber: 1 }); // different repo
+
+    const pending = getPendingPrs(db, 'owner/name');
+
+    expect(pending.map((r) => r.pr_number)).toEqual([1, 3]);
   });
 });
