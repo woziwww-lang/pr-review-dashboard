@@ -61,31 +61,44 @@ preference, but the product itself targets English-speaking developers.
 - **Data flow**:
   1. Cron job runs `gh pr list --repo <owner/repo> --state open --json
      number,title,author,headRefName,headRefOid,baseRefName,isDraft,url`.
-     `--state open` includes drafts, so the poller explicitly filters out
-     any result with `isDraft=true` after fetching (rather than relying on
-     an unsupported `gh` flag). `baseRefName` is retained so the review
-     step can diff the PR branch against the correct base, and `url` is
-     stored as `pr_url` for linking out to GitHub from the UI.
+     `--state open` includes drafts, so this single query is the source of
+     truth for "still open" regardless of draft status; `is_draft` is
+     stored on the row and used only to gate review-triggering (step 2),
+     never to decide `pr_state` (see below). `baseRefName` is retained so
+     the review step can diff the PR branch against the correct base, and
+     `url` is stored as `pr_url` for linking out to GitHub from the UI.
   2. Compare results against the `pull_requests` table:
-     - A PR is new, or its `head_sha` differs from `reviewed_head_sha` →
-       upsert a row (creating it with `review_status='pending'` if new)
-       and add it to this tick's in-memory processing queue.
-     - A previously tracked PR that no longer appears in the open-PR list
-       (closed or merged) is marked `pr_state='closed'` in the
-       `pull_requests` table; its row and last review are kept for
-       reference, but the List Page's default view filters to
-       `pr_state='open'` only. Conversely, any PR present in the poll
-       result always has `pr_state` set to `'open'` on that same upsert
-       (even if its `head_sha` is unchanged) — this reinstates a
-       previously-closed-then-reopened PR without requiring a new
-       `head_sha`.
+     - Every PR returned by the query (draft or not) is upserted with
+       `pr_state='open'` and its current `is_draft` flag — this is what
+       correctly re-opens a previously closed-then-reopened PR, and also
+       means a PR toggling between draft ↔ ready for review is never
+       misclassified as closed (it's simply present in the same open-PR
+       result throughout).
+     - Among those, a PR is enqueued for review only if `is_draft=false`
+       AND (it's new OR its `head_sha` differs from `reviewed_head_sha`)
+       AND it is not already `pending` or `reviewing` (see single-flight
+       rule in step 3). New rows start as `review_status='pending'`.
+     - A previously tracked PR that does not appear at all in this poll's
+       result (i.e., not open in any form, draft or not — closed or
+       merged) is marked `pr_state='closed'`; its row and last review are
+       kept for reference, but the List Page's default view filters to
+       `pr_state='open'` only.
      Update the `config` row `key='last_poll_at'` with the current
      timestamp on every poll tick (success or partial failure), so the
      List Page header can display it.
   3. The queue built in step 2 is processed in-process, one PR at a time
      (a PR sits in `review_status='pending'` from the moment it's enqueued
      until its turn comes up later in the same tick, which may take a
-     while if several PRs changed at once). Repo caching/worktree layout:
+     while if several PRs changed at once). **Single-flight rule:** a PR
+     already in `review_status='pending'` or `'reviewing'` is never
+     enqueued again — by the cron poller, by an overlapping poll tick, or
+     by the manual "Re-check now"/"Retry" action (see step 5); all three
+     paths check the same in-DB status immediately before enqueuing.
+     Additionally, the cron job itself is guarded by a run-level mutex (a
+     module-level "poll in progress" flag): if a poll tick is still
+     running (e.g., a slow `copilot` invocation) when the next scheduled
+     tick fires, the new tick is skipped entirely and logged, rather than
+     starting a second, overlapping poll. Repo caching/worktree layout:
      - A single bare/mirror clone per target repo lives at
        `~/.pr-review-dashboard/repos/<owner>__<repo>/repo.git` (created via
        `git clone --bare` on first use, then `git fetch` on each poll).
@@ -96,10 +109,6 @@ preference, but the product itself targets English-speaking developers.
        re-reviewing) from the bare repo. The base branch is fetched into
        the same bare repo, so `git diff <baseRefName>...<head_sha>` can be
        computed from within the worktree without a separate checkout.
-     - Before enqueuing, if the PR's current `review_status='reviewing'`
-       (from a still-running job), skip re-enqueuing it this tick — this
-       also applies to the manual "Re-check now"/"Retry" action (see step
-       5), which is a no-op if a review for that PR is already in flight.
      - Mark `review_status = 'reviewing'` in the DB immediately so the UI
        reflects in-progress state.
      - Spawn `copilot -p "<prompt>"` headless in the worktree directory. The
@@ -112,21 +121,25 @@ preference, but the product itself targets English-speaking developers.
        `raw_report_md` regardless of JSON parse success.
      - Delete old `findings` rows for the PR, insert new ones, update
        `pull_requests` (verdict, severity counts, `reviewed_head_sha`,
-       `last_reviewed_at`, `review_status='done'`).
+       `last_reviewed_at`, `last_attempted_at`, `review_status='done'`).
      - On any failure (fetch/checkout/spawn/timeout/non-zero exit), set
-       `review_status='failed'` and `error_message`, but leave the
-       previous successful review data (`raw_report_md`, findings, verdict)
-       untouched so the UI doesn't regress to a blank state.
+       `review_status='failed'`, `error_message`, and `last_attempted_at`,
+       but leave the previous successful review data (`raw_report_md`,
+       findings, verdict, `reviewed_head_sha`, `last_reviewed_at`)
+       untouched so the UI doesn't regress to a blank state — the Detail
+       Page distinguishes this from a normal successful review (see Pages
+       & Components: stale-data banner).
   4. Pages are Next.js Server Components that read directly from SQLite —
      no separate polling API needed for rendering.
   5. A manual "Re-check now"/"Retry" action (API route) lets a user force
      an immediate review for one PR without waiting for the next cron
      tick or a `head_sha` change — it always enqueues the PR (bypassing
      the "new or `head_sha` changed" gate in step 2), fetching the latest
-     `head_sha` first so the forced run reviews current code. It is a
-     no-op (surfaced to the user, e.g. a toast/disabled state) if that PR
-     is already `review_status='reviewing'`. Primarily for local
-     development/debugging.
+     `head_sha` first so the forced run reviews current code. Per the
+     single-flight rule in step 3, it is a no-op (surfaced to the user,
+     e.g. a toast/disabled state) if that PR is already `pending` or
+     `review_status='reviewing'`. Primarily for local development/
+     debugging.
 
 ## Data Model (SQLite)
 
@@ -146,9 +159,14 @@ CREATE TABLE pull_requests (
   base_branch TEXT,
   head_sha TEXT,
   pr_url TEXT,             -- link to the PR on GitHub, shown on both pages
-  pr_state TEXT DEFAULT 'open', -- 'open' | 'closed' (closed = merged or
-                                 -- closed upstream, no longer in the open-PR
-                                 -- poll result; row/review data retained)
+  is_draft INTEGER DEFAULT 0, -- gates review-triggering only; does not
+                               -- affect pr_state (see below)
+  pr_state TEXT DEFAULT 'open', -- 'open' | 'closed'. 'open' = present in
+                                 -- the latest `gh pr list --state open`
+                                 -- result, draft or not. 'closed' = absent
+                                 -- from that result entirely (merged or
+                                 -- closed upstream); row/review data
+                                 -- retained.
   review_status TEXT,      -- 'pending' | 'reviewing' | 'done' | 'failed'
                             -- pending = enqueued, not yet started;
                             -- reviewing = worktree/copilot run in progress;
@@ -160,7 +178,10 @@ CREATE TABLE pull_requests (
   severity_medium INTEGER DEFAULT 0,
   severity_low INTEGER DEFAULT 0,
   reviewed_head_sha TEXT,  -- head_sha as of the last completed review
-  last_reviewed_at TEXT,
+  last_reviewed_at TEXT,   -- set only on a successful review (done)
+  last_attempted_at TEXT,  -- set on every attempt, success or failure;
+                            -- used for the failed-review banner's
+                            -- "latest re-check failed at" timestamp
   raw_report_md TEXT,      -- full markdown report for the detail page
   error_message TEXT,      -- populated when review_status='failed'
   UNIQUE(repo, pr_number)
@@ -200,7 +221,15 @@ new set, and `pull_requests` fields are overwritten in place.
   - Medium/Low findings summarized as a list.
   - Collapsible full `raw_report_md` as a fallback (protects against gaps
     in structured parsing).
-  - If `review_status='failed'`: show `error_message` and a "Retry" action.
+  - If `review_status='failed'`: the page still renders the previous
+    successful review data in full (Executive Summary, Top Risks,
+    Medium/Low, raw report) since that is what's stored, but shows a
+    prominent banner above it: "⚠ Latest re-check failed at
+    `<last_attempted_at>`: `<error_message>`. Showing results from the
+    last successful review (`<last_reviewed_at>`, commit
+    `<reviewed_head_sha>`)." plus a "Retry" action. This makes clear to
+    the user that the visible findings may not reflect the PR's current
+    code.
 - Both pages expose a "Re-check now" button that calls an API route to
   force an immediate review cycle for that PR.
 
