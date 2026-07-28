@@ -53,7 +53,11 @@ preference, but the product itself targets English-speaking developers.
   `node-cron` for scheduling, `gh` CLI for PR metadata, `copilot` CLI in
   headless mode for review execution.
 - **Single process**: `npm run dev` starts Next.js. An `instrumentation.ts`
-  `register()` hook registers a cron job that runs every 5 minutes.
+  `register()` hook registers a cron job that runs every 5 minutes. Because
+  Next.js dev mode can invoke `register()` more than once (e.g., on hot
+  reload), the hook guards itself with a module-level flag (e.g. a global
+  singleton keyed off `globalThis`) so a second invocation is a no-op and
+  only one cron job is ever active per process.
 - **Data flow**:
   1. Cron job runs `gh pr list --repo <owner/repo> --state open --json
      number,title,author,headRefName,headRefOid,baseRefName,isDraft,url`.
@@ -70,7 +74,11 @@ preference, but the product itself targets English-speaking developers.
        (closed or merged) is marked `pr_state='closed'` in the
        `pull_requests` table; its row and last review are kept for
        reference, but the List Page's default view filters to
-       `pr_state='open'` only.
+       `pr_state='open'` only. Conversely, any PR present in the poll
+       result always has `pr_state` set to `'open'` on that same upsert
+       (even if its `head_sha` is unchanged) — this reinstates a
+       previously-closed-then-reopened PR without requiring a new
+       `head_sha`.
      Update the `config` row `key='last_poll_at'` with the current
      timestamp on every poll tick (success or partial failure), so the
      List Page header can display it.
@@ -90,9 +98,8 @@ preference, but the product itself targets English-speaking developers.
        computed from within the worktree without a separate checkout.
      - Before enqueuing, if the PR's current `review_status='reviewing'`
        (from a still-running job), skip re-enqueuing it this tick — this
-       also applies to the manual "Re-check now"/"Retry" action, which is
-       a no-op (surfaced to the user) if a review for that PR is already
-       in flight.
+       also applies to the manual "Re-check now"/"Retry" action (see step
+       5), which is a no-op if a review for that PR is already in flight.
      - Mark `review_status = 'reviewing'` in the DB immediately so the UI
        reflects in-progress state.
      - Spawn `copilot -p "<prompt>"` headless in the worktree directory. The
@@ -112,9 +119,14 @@ preference, but the product itself targets English-speaking developers.
        untouched so the UI doesn't regress to a blank state.
   4. Pages are Next.js Server Components that read directly from SQLite —
      no separate polling API needed for rendering.
-  5. A manual "Re-check now" action (API route) lets a user force an
-     immediate poll+review cycle for one PR without waiting for the next
-     cron tick — primarily for local development/debugging.
+  5. A manual "Re-check now"/"Retry" action (API route) lets a user force
+     an immediate review for one PR without waiting for the next cron
+     tick or a `head_sha` change — it always enqueues the PR (bypassing
+     the "new or `head_sha` changed" gate in step 2), fetching the latest
+     `head_sha` first so the forced run reviews current code. It is a
+     no-op (surfaced to the user, e.g. a toast/disabled state) if that PR
+     is already `review_status='reviewing'`. Primarily for local
+     development/debugging.
 
 ## Data Model (SQLite)
 
