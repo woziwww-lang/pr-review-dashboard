@@ -6,9 +6,11 @@ import { getConfig } from '../../../db/config';
 import { getByNumber } from '../../../db/pullRequests';
 import { getFindingsByPrId } from '../../../db/findings';
 import { buildDetailPageViewModel } from '../../../lib/detailPageViewModel';
+import { buildSeveritySummary } from '../../../lib/severitySummary';
 import { VerdictBadge } from '../../components/VerdictBadge';
 import { FindingCard } from '../../components/FindingCard';
 import { RecheckButton } from '../../components/RecheckButton';
+import { SeverityDonut } from '../../components/SeverityDonut';
 import { Card } from '../../components/ui/card';
 
 export const dynamic = 'force-dynamic';
@@ -30,6 +32,7 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
   // getByNumber() above, so no view-model shape change is needed to
   // give RecheckButton the in-progress signal it needs to disable itself.
   const isInProgress = pr.review_status === 'pending' || pr.review_status === 'reviewing';
+  const severitySummary = buildSeveritySummary([pr]);
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-6 px-6 py-10">
@@ -74,6 +77,12 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
 
       {vm.state !== 'failed-no-prior-success' && (
         <>
+          {pr.last_reviewed_at !== null && (
+            <div className="flex justify-center">
+              <SeverityDonut summary={severitySummary} />
+            </div>
+          )}
+
           <Card className="flex flex-col gap-2 card-glass p-4">
             <h2 className="text-sm font-medium text-muted-foreground">Executive Summary</h2>
             {/* Note: DetailPageViewModel has no separate free-text
