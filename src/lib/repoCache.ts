@@ -38,6 +38,11 @@ export function getWorktreePath(repo: string, prNumber: number): string {
   return path.join(getReposRootDir(), repoDirName(repo), 'worktrees', `pr-${prNumber}`);
 }
 
+async function hasRegisteredWorktree(bareDir: string, worktreeDir: string): Promise<boolean> {
+  const { stdout } = await execFileAsync('git', ['--git-dir', bareDir, 'worktree', 'list', '--porcelain']);
+  return stdout.split('\n').some((line) => line === `worktree ${worktreeDir}`);
+}
+
 // Read-only against the remote: only `clone --bare` (first use) and
 // `fetch` (subsequent polls) are ever run against the remote. Nothing
 // here ever pushes or mutates a remote ref.
@@ -52,8 +57,8 @@ export async function ensureBareRepo(repo: string): Promise<void> {
   await execFileAsync('git', ['clone', '--bare', `https://github.com/${repo}.git`, bareDir]);
 }
 
-// Purely local: `git worktree add` never touches the remote. Re-points an
-// existing worktree with `--force` when re-reviewing at a new head_sha.
+// Only `fetch` touches the remote here. `worktree list/remove/add` stay purely
+// local against the bare repo, including re-creating stale PR worktrees.
 export async function addOrUpdateWorktree(
   repo: string,
   prNumber: number,
@@ -63,12 +68,16 @@ export async function addOrUpdateWorktree(
   const worktreeDir = getWorktreePath(repo, prNumber);
   fs.mkdirSync(path.dirname(worktreeDir), { recursive: true });
 
-  const args = ['--git-dir', bareDir, 'worktree', 'add'];
-  if (fs.existsSync(worktreeDir)) {
-    args.push('--force');
-  }
-  args.push('--detach', worktreeDir, headSha);
+  const hasWorktree = await hasRegisteredWorktree(bareDir, worktreeDir);
+  await execFileAsync('git', [
+    '--git-dir', bareDir,
+    'fetch', 'origin', `+refs/pull/${prNumber}/head:refs/remotes/origin/pr-${prNumber}`,
+  ]);
 
-  await execFileAsync('git', args);
+  if (hasWorktree) {
+    await execFileAsync('git', ['--git-dir', bareDir, 'worktree', 'remove', '--force', worktreeDir]);
+  }
+
+  await execFileAsync('git', ['--git-dir', bareDir, 'worktree', 'add', '--detach', worktreeDir, headSha]);
   return worktreeDir;
 }

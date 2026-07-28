@@ -73,27 +73,52 @@ describe('addOrUpdateWorktree', () => {
     execFileMock.mockClear();
     existsSyncMock.mockReset();
     mkdirSyncMock.mockReset();
+    execFileMock.mockImplementation((_cmd, _args, cb) => cb(null, '', ''));
   });
 
-  it('adds a fresh worktree when none exists for this PR yet', async () => {
+  it('fetches the PR head and adds a fresh worktree when none is registered yet', async () => {
     existsSyncMock.mockReturnValue(false);
 
     const dir = await addOrUpdateWorktree('owner/name', 42, 'sha1');
 
     expect(dir).toMatch(/worktrees[/\\]pr-42$/);
-    const [, args] = execFileMock.mock.calls[0];
-    expect(args).toEqual(expect.arrayContaining(['worktree', 'add', '--detach', dir, 'sha1']));
-    expect(args).not.toContain('--force');
+    expect(execFileMock).toHaveBeenCalledTimes(3);
+    expect(execFileMock.mock.calls[0][1]).toEqual(
+      expect.arrayContaining(['worktree', 'list', '--porcelain'])
+    );
+    expect(execFileMock.mock.calls[1][1]).toEqual(
+      expect.arrayContaining(['fetch', 'origin', '+refs/pull/42/head:refs/remotes/origin/pr-42'])
+    );
+    expect(execFileMock.mock.calls[2][1]).toEqual(
+      expect.arrayContaining(['worktree', 'add', '--detach', dir, 'sha1'])
+    );
   });
 
-  it('force re-points an existing worktree to the new head_sha', async () => {
-    existsSyncMock.mockReturnValue(true);
+  it('removes a registered worktree before recreating it at the new head_sha', async () => {
+    existsSyncMock.mockReturnValue(false);
+    const registeredDir = getWorktreePath('owner/name', 42);
+    execFileMock.mockImplementation((_cmd, args, cb) => {
+      if (args.includes('list')) {
+        cb(null, `worktree ${registeredDir}\n`, '');
+        return;
+      }
+      cb(null, '', '');
+    });
 
     const dir = await addOrUpdateWorktree('owner/name', 42, 'sha2');
 
-    const [, args] = execFileMock.mock.calls[0];
-    expect(args).toEqual(
-      expect.arrayContaining(['worktree', 'add', '--force', '--detach', dir, 'sha2'])
+    expect(execFileMock).toHaveBeenCalledTimes(4);
+    expect(execFileMock.mock.calls[0][1]).toEqual(
+      expect.arrayContaining(['worktree', 'list', '--porcelain'])
+    );
+    expect(execFileMock.mock.calls[1][1]).toEqual(
+      expect.arrayContaining(['fetch', 'origin', '+refs/pull/42/head:refs/remotes/origin/pr-42'])
+    );
+    expect(execFileMock.mock.calls[2][1]).toEqual(
+      expect.arrayContaining(['worktree', 'remove', '--force', dir])
+    );
+    expect(execFileMock.mock.calls[3][1]).toEqual(
+      expect.arrayContaining(['worktree', 'add', '--detach', dir, 'sha2'])
     );
   });
 });
