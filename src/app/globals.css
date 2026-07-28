@@ -37,6 +37,15 @@
   --color-popover: var(--popover);
   --color-card-foreground: var(--card-foreground);
   --color-card: var(--card);
+  --color-glass-bg: var(--glass-bg);
+  --color-glass-border: var(--glass-border);
+  --shadow-glass: var(--glass-shadow);
+  --shadow-glass-hover: var(--glass-shadow-hover);
+  --shadow-accent-glow: var(--accent-glow);
+  --color-severity-critical: var(--severity-critical);
+  --color-severity-high: var(--severity-high);
+  --color-severity-medium: var(--severity-medium);
+  --color-severity-low: var(--severity-low);
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);
@@ -70,7 +79,16 @@
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
-  --radius: 0.75rem;
+  --radius: 1rem;
+  --glass-bg: rgba(255, 255, 255, 0.03);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  --glass-shadow-hover: 0 12px 32px rgba(0, 0, 0, 0.4);
+  --accent-glow: 0 0 12px rgba(59, 130, 246, 0.4);
+  --severity-critical: #991b1b;
+  --severity-high: #f87171;
+  --severity-medium: #fbbf24;
+  --severity-low: #3f3f46;
   --sidebar: #18181b;
   --sidebar-foreground: #fafafa;
   --sidebar-primary: #3b82f6;
@@ -102,4 +120,29 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* Deliberately NOT inside @layer: CSS Cascade Layers give unlayered
+   rules priority over every @layer-wrapped rule (including Tailwind's
+   own utilities layer), regardless of source order or specificity. This
+   guarantees .card-glass reliably overrides shadcn <Card>'s built-in
+   bg-card/ring-1/rounded-xl utility classes instead of silently losing
+   the cascade to them. border-radius is set explicitly to 1rem (16px)
+   rather than relying on Card's own rounded-xl (which scales off
+   --radius-xl = --radius * 1.4 = 1.4rem) so glass cards render at a
+   consistent 16px regardless of which rounded-* utility a wrapped
+   element happens to use. */
+.card-glass {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 1rem;
+  box-shadow: var(--glass-shadow);
+}
+
+/* Layered 3-stop gradient applied on top of body's existing solid
+   bg-background fill (see layout.tsx) - background-image renders over
+   background-color, so --background still provides a solid fallback
+   (no-JS, print, or if this rule fails to load) underneath. */
+.app-gradient {
+  background-image: linear-gradient(180deg, #0a0a0c 0%, #050506 60%, #020203 100%);
 }
