@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 import { fetchOpenPrs } from './gh';
-import { ensureBareRepo, addOrUpdateWorktree } from './repoCache';
+import { ensureBareRepo, addOrUpdateWorktree, resolveLocalBaseSha } from './repoCache';
 import { runReview } from './reviewRunner';
 import { buildReviewPrompt } from './reviewPrompt';
 import { parseReviewOutput } from './parseReviewOutput';
@@ -95,15 +95,17 @@ export async function processOnePr(
   markReviewing(db, id);
 
   let worktreeDir: string;
+  let baseSha: string;
   try {
     await ensureBareRepo(repo);
     worktreeDir = await addOrUpdateWorktree(repo, prNumber, headSha);
+    baseSha = await resolveLocalBaseSha(repo, baseBranch);
   } catch (err) {
     markFailed(db, id, err instanceof Error ? err.message : String(err));
     return;
   }
 
-  const prompt = buildReviewPrompt({ repo, prNumber, title, branch, baseBranch });
+  const prompt = buildReviewPrompt({ repo, prNumber, title, branch, baseBranch, baseSha });
   const result = await runReview(worktreeDir, prompt, REVIEW_TIMEOUT_MS);
 
   if (!result.success) {

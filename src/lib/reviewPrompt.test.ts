@@ -9,6 +9,7 @@ describe('buildReviewPrompt', () => {
       title: 'Add login form',
       branch: 'feat/login',
       baseBranch: 'main',
+      baseSha: 'abc1234',
     });
 
     expect(prompt).toContain('owner/name');
@@ -16,10 +17,12 @@ describe('buildReviewPrompt', () => {
     expect(prompt).toContain('Add login form');
     expect(prompt).toContain('feat/login');
     expect(prompt).toContain('main');
+    expect(prompt).toContain('abc1234');
     expect(prompt).toContain('local-advanced-code-review');
     expect(prompt).toContain('```json');
     expect(prompt).toContain('"verdict"');
     expect(prompt).toContain('"findings"');
     expect(prompt.toLowerCase()).toContain('do not push');
+    expect(prompt.toLowerCase()).toContain('do not run `git fetch`'.toLowerCase());
   });
 });

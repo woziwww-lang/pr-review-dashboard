@@ -19,6 +19,7 @@ const {
   getWorktreePath,
   ensureBareRepo,
   addOrUpdateWorktree,
+  resolveLocalBaseSha,
 } = await import('./repoCache');
 
 describe('repoCache paths', () => {
@@ -120,5 +121,35 @@ describe('addOrUpdateWorktree', () => {
     expect(execFileMock.mock.calls[3][1]).toEqual(
       expect.arrayContaining(['worktree', 'add', '--detach', dir, 'sha2'])
     );
+  });
+});
+
+describe('resolveLocalBaseSha', () => {
+  beforeEach(() => {
+    execFileMock.mockClear();
+  });
+
+  it('runs rev-parse against the bare repo (--git-dir), not any worktree, and trims the result', async () => {
+    execFileMock.mockImplementation((_cmd, _args, cb) => cb(null, 'abc1234\n', ''));
+
+    const sha = await resolveLocalBaseSha('owner/name', 'main');
+
+    expect(sha).toBe('abc1234');
+    expect(execFileMock).toHaveBeenCalledWith(
+      'git',
+      ['--git-dir', getBareRepoPath('owner/name'), 'rev-parse', 'refs/heads/main'],
+      expect.any(Function)
+    );
+  });
+
+  it('performs no network-touching git subcommand (no fetch/clone/pull in the args)', async () => {
+    execFileMock.mockImplementation((_cmd, _args, cb) => cb(null, 'deadbeef\n', ''));
+
+    await resolveLocalBaseSha('owner/name', 'develop');
+
+    const [, args] = execFileMock.mock.calls[0];
+    expect(args).not.toEqual(expect.arrayContaining(['fetch']));
+    expect(args).not.toEqual(expect.arrayContaining(['clone']));
+    expect(args).not.toEqual(expect.arrayContaining(['pull']));
   });
 });

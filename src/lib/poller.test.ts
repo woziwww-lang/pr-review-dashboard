@@ -9,9 +9,11 @@ vi.mock('./gh', () => ({ fetchOpenPrs: (...args: unknown[]) => fetchOpenPrsMock(
 
 const ensureBareRepoMock = vi.fn().mockResolvedValue(undefined);
 const addOrUpdateWorktreeMock = vi.fn().mockResolvedValue('/tmp/worktrees/pr-1');
+const resolveLocalBaseShaMock = vi.fn().mockResolvedValue('basesha1');
 vi.mock('./repoCache', () => ({
   ensureBareRepo: (...args: unknown[]) => ensureBareRepoMock(...args),
   addOrUpdateWorktree: (...args: unknown[]) => addOrUpdateWorktreeMock(...args),
+  resolveLocalBaseSha: (...args: unknown[]) => resolveLocalBaseShaMock(...args),
 }));
 
 const runReviewMock = vi.fn();
@@ -38,6 +40,7 @@ describe('runPollTick', () => {
     fetchOpenPrsMock.mockReset();
     ensureBareRepoMock.mockClear();
     addOrUpdateWorktreeMock.mockClear();
+    resolveLocalBaseShaMock.mockClear();
     runReviewMock.mockReset();
   });
 
@@ -57,6 +60,7 @@ describe('runPollTick', () => {
     expect(getConfig(db, 'last_poll_status')).toBe('ok');
     expect(ensureBareRepoMock).toHaveBeenCalledWith('owner/name');
     expect(addOrUpdateWorktreeMock).toHaveBeenCalledWith('owner/name', 1, 'sha1');
+    expect(resolveLocalBaseShaMock).toHaveBeenCalledWith('owner/name', 'main');
   });
 
   it('skips a draft PR entirely (tracked but never reviewed)', async () => {

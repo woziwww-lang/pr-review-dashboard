@@ -43,6 +43,22 @@ async function hasRegisteredWorktree(bareDir: string, worktreeDir: string): Prom
   return stdout.split('\n').some((line) => line === `worktree ${worktreeDir}`);
 }
 
+// `ensureBareRepo()` mirrors every remote branch into the bare repo on each
+// poll (`+refs/heads/*:refs/heads/*`), so the base branch's local ref is
+// already up to date by the time a review runs — there is no need for the
+// review session itself to `git fetch` again. This resolves that local ref
+// to a concrete SHA so the review prompt can diff against a pinned commit
+// instead of a moving branch name, keeping the review fully offline and
+// deterministic against exactly what was mirrored at poll time.
+export async function resolveLocalBaseSha(repo: string, baseBranch: string): Promise<string> {
+  const bareDir = getBareRepoPath(repo);
+  const { stdout } = await execFileAsync('git', [
+    '--git-dir', bareDir,
+    'rev-parse', `refs/heads/${baseBranch}`,
+  ]);
+  return stdout.trim();
+}
+
 // Read-only against the remote: only `clone --bare` (first use) and
 // `fetch` (subsequent polls) are ever run against the remote. Nothing
 // here ever pushes or mutates a remote ref.
