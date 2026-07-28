@@ -61,21 +61,42 @@ these surfaces. This upgrade must do two things together, not tokens alone:
    border/one shadow/one background per card, not two stacked.
 
    **Explicit file-by-file disposition of every hardcoded-hex utility found in the
-   codebase** (this list is exhaustive — nothing hex-literal is left undecided):
-   - `src/app/page.tsx`, `src/app/pr/[number]/page.tsx`: replace their `border-[#27272A]
-     bg-[#18181B]`-style card-surface classes with `.card-glass`; replace
-     `text-[#FAFAFA]`/`text-[#D4D4D8]` literal text-color utilities with the existing
-     semantic `text-foreground`/`text-muted-foreground` utilities.
-   - `src/app/components/FindingCard.tsx`: replace `border-[#27272A] bg-[#18181B]` (line 27)
-     with `.card-glass`; replace `text-[#FAFAFA]` (line 31) with `text-foreground`; replace
-     all three `text-[#D4D4D8]` occurrences (lines 36/39/42) with `text-muted-foreground`;
-     the inner code-snippet background `bg-[#09090B]` (line 45) is **kept as-is** — it is an
-     intentionally-darker nested "well" inside the glass card (a `<pre>` code block), not a
-     card surface, and changing it is out of scope for this visual pass.
+   codebase** (verified via `grep -rn "\[#" src/app --include="*.tsx"` — this list is
+   exhaustive, covering every match; nothing hex-literal is left undecided):
+   - `src/app/page.tsx`:
+     - `border-[#27272A] bg-[#18181B]` (PR row card, line 37) → `.card-glass`.
+     - `text-[#FAFAFA]` (repo heading line 27, row title line 73) → `text-foreground`.
+     - `hover:border-[#3B82F6]/40` (line 37) and `focus-visible:outline-[#3B82F6]`
+       (line 62) and `bg-[#3B82F6]` (pulse-dot indicator, line 85) → these three are all
+       literally the same value as `--primary` (`#3b82f6`, confirmed in `globals.css`);
+       replace with the semantic equivalents `hover:border-primary/40`,
+       `focus-visible:outline-primary`, `bg-primary` — a drive-by consistency fix (same
+       rendered color, now token-driven), not a new color decision.
+   - `src/app/pr/[number]/page.tsx`:
+     - `text-[#FAFAFA]` (lines 36 `hover:text-[#FAFAFA]`, 42) → `text-foreground` /
+       `hover:text-foreground`.
+     - `border-[#27272A] bg-[#18181B]` (lines 77, 91, 98, 106 — including the `<details>`
+       block) → `.card-glass`.
+     - `text-[#D4D4D8]` (line 85) → `text-muted-foreground`.
+     - The warning banner (`border-[#451A03] bg-[#FBBF24]/10 text-[#FBBF24]`, line 51) and
+       error banner (`border-[#450A0A] bg-[#F87171]/10 text-[#F87171]`, line 65): **kept
+       as-is, unchanged** — same reasoning as `PollStatusBanner.tsx` below (semantic
+       warning/error banners, out of scope for this card/surface restyle).
+   - `src/app/components/FindingCard.tsx`: replace `border-[#27272A] bg-[#18181B]`
+     (line 27) with `.card-glass`; replace `text-[#FAFAFA]` (line 31) with
+     `text-foreground`; replace all three `text-[#D4D4D8]` occurrences (lines 36/39/42)
+     with `text-muted-foreground`; the inner code-snippet background `bg-[#09090B]`
+     (line 45) is **kept as-is** — it is an intentionally-darker nested "well" inside the
+     glass card (a `<pre>` code block), not a card surface, and changing it is out of
+     scope for this visual pass.
    - `src/app/components/PollStatusBanner.tsx` (line 18: `border-[#451A03] bg-[#FBBF24]/10
      text-[#FBBF24]`): **kept as-is, unchanged.** This is a status/warning banner, not a
      card surface — its amber hex values are a semantic "warning" color, not a
      card/border/base-text color this glass pass touches. Out of scope for this spec.
+   - `src/app/components/RecheckButton.tsx` (line 83: `bg-gradient-to-r from-[#3B82F6]
+     to-[#2563EB]`): **kept as-is, unchanged.** This is the button's own accent-gradient
+     styling (an interactive control, not a card surface); it is not part of the
+     card/border/base-text restyle this spec covers.
    - `src/app/components/VerdictBadge.tsx` (lines 21-24) and
      `src/app/components/SeverityBadge.tsx` (lines 6-9): **kept as-is, unchanged.** These
      are the existing per-verdict/per-severity semantic color gradients (green=approve,
@@ -102,10 +123,12 @@ Additional changes:
 - `body`'s background moves from a flat `bg-background` fill to a 3-stop layered gradient.
   Concretely: add a `.app-gradient` utility in `@layer base` — 
   `background-image: linear-gradient(180deg, #0a0a0c 0%, #050506 60%, #020203 100%)` — and
-  apply it to `body` in `src/app/layout.tsx` alongside (not replacing) the existing
-  `bg-background` class, so `--background` still provides a solid-color fallback (no-JS,
-  print, or if the gradient rule fails to load) while the gradient renders on top in normal
-  browsers.
+  apply it via `className="min-h-full flex flex-col app-gradient"` on `body` in
+  `src/app/layout.tsx` (currently just `"min-h-full flex flex-col"`). The existing
+  `body { @apply bg-background text-foreground; }` rule in `globals.css` (which today
+  provides `body`'s only background) is left unchanged, so `--background`'s solid color
+  still renders as the base layer (no-JS, print, or if the gradient rule fails to load)
+  while `.app-gradient`'s `background-image` layers on top of it in normal browsers.
 - Base `--radius` in `globals.css` increases from `0.75rem` to `1rem` (16px), used by both
   the new `.card-glass` class and every existing consumer of the `--radius-*` scale
   (`Card`/`Badge`/`Button` from shadcn) — no structural change to the scale itself, just
@@ -279,8 +302,8 @@ export function buildSeveritySummary(rows: PullRequestRow[]): SeveritySummary;
   `PollStatusBanner`/`FindingCard`/`RecheckButton`/page component tests are not expected to
   need any changes since their props/behavior are untouched — only the CSS tokens they
   render against change.
-- `npm run lint` / `npm run build` must stay clean, same as every prior chunk in this
-  session.
+- `npm test` / `npm run lint` / `npm run build` must all stay clean, same as every prior
+  chunk in this session.
 
 ## Rollout
 
