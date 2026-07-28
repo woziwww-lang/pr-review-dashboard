@@ -9,6 +9,14 @@ describe('VerdictBadge', () => {
     expect(screen.getByText(/approve/i)).toBeInTheDocument();
   });
 
+  it('applies the accent glow shadow only to the approve badge', () => {
+    const { container: approveContainer } = render(<VerdictBadge verdict="approve" />);
+    expect(approveContainer.querySelector('.shadow-accent-glow')).toBeInTheDocument();
+
+    const { container: needsFixContainer } = render(<VerdictBadge verdict="needs_fix" />);
+    expect(needsFixContainer.querySelector('.shadow-accent-glow')).not.toBeInTheDocument();
+  });
+
   it('renders a needs_fix badge', () => {
     render(<VerdictBadge verdict="needs_fix" />);
     expect(screen.getByText(/needs fix/i)).toBeInTheDocument();

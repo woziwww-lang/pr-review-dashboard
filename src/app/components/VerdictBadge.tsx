@@ -18,7 +18,7 @@ const ICONS: Record<BadgeVerdict, typeof CircleCheck> = {
 };
 
 const CLASSES: Record<BadgeVerdict, string> = {
-  approve: 'bg-gradient-to-r from-[#22C55E] to-[#16A34A] text-white border-transparent',
+  approve: 'bg-gradient-to-r from-[#22C55E] to-[#16A34A] text-white border-transparent shadow-accent-glow',
   needs_review: 'bg-gradient-to-r from-[#FBBF24] to-[#F59E0B] text-[#451A03] border-transparent',
   needs_fix: 'bg-gradient-to-r from-[#F87171] to-[#DC2626] text-white border-transparent',
   failed: 'bg-[#3F3F46] text-[#A1A1AA] border-transparent',
