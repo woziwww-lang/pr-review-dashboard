@@ -24,22 +24,22 @@ const BORDER_COLORS: Record<Severity, string> = {
 export function FindingCard({ finding }: { finding: FindingCardInput }) {
   return (
     <div
-      className="mb-2 rounded-lg border border-[#27272A] bg-[#18181B] p-3 pl-4"
+      className="mb-2 card-glass p-3 pl-4"
       style={{ borderLeft: `3px solid ${BORDER_COLORS[finding.severity]}` }}
     >
       <div className="mb-1 flex items-center gap-2">
-        <SeverityBadge severity={finding.severity} /> <strong className="text-[#FAFAFA]">{finding.summary}</strong>
+        <SeverityBadge severity={finding.severity} /> <strong className="text-foreground">{finding.summary}</strong>
       </div>
       <p className="font-mono text-xs text-muted-foreground">
         {finding.file}:{finding.line}
       </p>
-      <p className="mt-2 text-sm text-[#D4D4D8]">
+      <p className="mt-2 text-sm text-muted-foreground">
         <em>Failure scenario:</em> {finding.failureScenario}
       </p>
-      <p className="mt-1 text-sm text-[#D4D4D8]">
+      <p className="mt-1 text-sm text-muted-foreground">
         <em>Evidence:</em> {finding.evidence}
       </p>
-      <p className="mt-1 text-sm text-[#D4D4D8]">
+      <p className="mt-1 text-sm text-muted-foreground">
         <em>Fix:</em> {finding.fixSuggestion}
       </p>
       <pre className="mt-2 overflow-x-auto rounded bg-[#09090B] p-2 font-mono text-xs">{finding.codeSnippet}</pre>
