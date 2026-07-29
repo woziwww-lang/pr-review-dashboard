@@ -9,6 +9,7 @@ import { buildDetailPageViewModel } from '../../../lib/detailPageViewModel';
 import { buildSeveritySummary } from '../../../lib/severitySummary';
 import { VerdictBadge } from '../../components/VerdictBadge';
 import { FindingCard } from '../../components/FindingCard';
+import { HoverLiftCard } from '../../components/HoverLiftCard';
 import { RecheckButton } from '../../components/RecheckButton';
 import { SeverityDonut } from '../../components/SeverityDonut';
 import { Card } from '../../components/ui/card';
@@ -83,33 +84,39 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
             </div>
           )}
 
-          <Card className="flex flex-col gap-2 card-glass p-4">
-            <h2 className="text-sm font-medium text-muted-foreground">Executive Summary</h2>
-            {/* Note: DetailPageViewModel has no separate free-text
-                "summary" field (verified against src/lib/detailPageViewModel.ts)
-                - the verdict badge + severity counts below *are* the
-                executive summary. No view-model change is made to
-                introduce a summary-text field, per the spec's Non-Goals. */}
-            {vm.verdict && <VerdictBadge verdict={vm.verdict as 'approve' | 'needs_fix' | 'needs_review'} />}
-            <p className="text-sm text-muted-foreground">
-              Critical: {vm.severityCritical}, High: {vm.severityHigh}, Medium: {vm.severityMedium}, Low:{' '}
-              {vm.severityLow}
-            </p>
-          </Card>
+          <HoverLiftCard>
+            <Card className="flex flex-col gap-2 card-glass p-4">
+              <h2 className="text-sm font-medium text-muted-foreground">Executive Summary</h2>
+              {/* Note: DetailPageViewModel has no separate free-text
+                  "summary" field (verified against src/lib/detailPageViewModel.ts)
+                  - the verdict badge + severity counts below *are* the
+                  executive summary. No view-model change is made to
+                  introduce a summary-text field, per the spec's Non-Goals. */}
+              {vm.verdict && <VerdictBadge verdict={vm.verdict as 'approve' | 'needs_fix' | 'needs_review'} />}
+              <p className="text-sm text-muted-foreground">
+                Critical: {vm.severityCritical}, High: {vm.severityHigh}, Medium: {vm.severityMedium}, Low:{' '}
+                {vm.severityLow}
+              </p>
+            </Card>
+          </HoverLiftCard>
 
-          <Card className="flex flex-col gap-2 card-glass p-4">
-            <h2 className="text-sm font-medium text-muted-foreground">Top Risks</h2>
-            {vm.topRisks.map((f) => (
-              <FindingCard key={f.id} finding={f} />
-            ))}
-          </Card>
+          <HoverLiftCard>
+            <Card className="flex flex-col gap-2 card-glass p-4">
+              <h2 className="text-sm font-medium text-muted-foreground">Top Risks</h2>
+              {vm.topRisks.map((f) => (
+                <FindingCard key={f.id} finding={f} />
+              ))}
+            </Card>
+          </HoverLiftCard>
 
-          <Card className="flex flex-col gap-2 card-glass p-4 opacity-80">
-            <h2 className="text-sm font-medium text-muted-foreground">Medium/Low</h2>
-            {vm.mediumLow.map((f) => (
-              <FindingCard key={f.id} finding={f} />
-            ))}
-          </Card>
+          <HoverLiftCard>
+            <Card className="flex flex-col gap-2 card-glass p-4 opacity-80">
+              <h2 className="text-sm font-medium text-muted-foreground">Medium/Low</h2>
+              {vm.mediumLow.map((f) => (
+                <FindingCard key={f.id} finding={f} />
+              ))}
+            </Card>
+          </HoverLiftCard>
 
           {vm.rawReportMd && (
             <details className="card-glass p-4">
