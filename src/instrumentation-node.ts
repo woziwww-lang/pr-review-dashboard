@@ -32,10 +32,21 @@ export async function register(): Promise<void> {
   resetStuckReviews(db);
 
   cron.schedule('*/5 * * * *', () => {
-    void withPollLock(() => runPollTick(db, repo));
+    void withPollLock(() => runPollTick(db, repo)).catch((err) => {
+      console.error('Scheduled poll tick failed:', err);
+    });
   });
 
   // Also poll immediately on startup, rather than waiting a full 5
-  // minutes for the first result after the app comes up.
-  await withPollLock(() => runPollTick(db, repo));
+  // minutes for the first result after the app comes up. This is
+  // intentionally NOT awaited: Next.js does not begin serving HTTP
+  // requests until register() resolves, and a startup poll can run a
+  // full code review per pending PR (spawning `copilot`, up to
+  // REVIEW_TIMEOUT_MS each) - awaiting it here would make the entire
+  // dashboard unresponsive for minutes after every restart whenever a
+  // PR is left pending. Firing it in the background lets the server
+  // start accepting requests immediately while the poll/review runs.
+  void withPollLock(() => runPollTick(db, repo)).catch((err) => {
+    console.error('Startup poll tick failed:', err);
+  });
 }

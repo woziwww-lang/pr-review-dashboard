@@ -32,7 +32,8 @@ describe('instrumentation register()', () => {
     setConfigMock.mockClear();
     resetStuckReviewsMock.mockClear();
     withPollLockMock.mockClear();
-    runPollTickMock.mockClear();
+    runPollTickMock.mockReset();
+    runPollTickMock.mockResolvedValue(undefined);
     (globalThis as { __prDashboardCronRegistered?: boolean }).__prDashboardCronRegistered = undefined;
     exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
       throw new Error(`process.exit(${code}) called`);
@@ -55,6 +56,26 @@ describe('instrumentation register()', () => {
     expect(scheduleMock).toHaveBeenCalledWith('*/5 * * * *', expect.any(Function));
     expect(withPollLockMock).toHaveBeenCalledTimes(1); // immediate startup poll
     expect(runPollTickMock).toHaveBeenCalledWith(dbStub, 'owner/name');
+  });
+
+  it('does not block server startup on the immediate poll (register resolves before the poll settles)', async () => {
+    process.env.TARGET_REPO = 'owner/name';
+    let resolvePoll!: () => void;
+    runPollTickMock.mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolvePoll = resolve;
+      })
+    );
+
+    const { register } = await import('./instrumentation-node');
+
+    // If register() incorrectly awaited the poll internally, this would
+    // hang until vitest's test timeout, since resolvePoll() is never
+    // called before the assertions below run.
+    await register();
+
+    expect(withPollLockMock).toHaveBeenCalledTimes(1);
+    resolvePoll();
   });
 
   it('is a no-op on a second call in the same process (dev hot-reload guard)', async () => {
