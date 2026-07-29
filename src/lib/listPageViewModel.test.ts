@@ -69,6 +69,7 @@ function prRow(overrides: Partial<PullRequestRow>): PullRequestRow {
     last_attempted_at: '2026-07-28T00:00:00.000Z',
     raw_report_md: '# report',
     error_message: null,
+    closed_at: null,
     ...overrides,
   };
 }

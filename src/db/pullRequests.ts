@@ -23,7 +23,7 @@ export interface PullRequestRow {
   head_sha: string;
   pr_url: string;
   is_draft: number;
-  pr_state: 'open' | 'closed';
+  pr_state: 'open' | 'merged' | 'closed';
   review_status: 'pending' | 'reviewing' | 'done' | 'failed';
   verdict: string | null;
   severity_critical: number;
@@ -35,6 +35,7 @@ export interface PullRequestRow {
   last_attempted_at: string | null;
   raw_report_md: string | null;
   error_message: string | null;
+  closed_at: string | null;
 }
 
 /**

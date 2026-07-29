@@ -26,6 +26,7 @@ function makeRow(overrides: Partial<PullRequestRow>): PullRequestRow {
     last_attempted_at: '2026-07-29T00:00:00.000Z',
     raw_report_md: null,
     error_message: null,
+    closed_at: null,
     ...overrides,
   };
 }
