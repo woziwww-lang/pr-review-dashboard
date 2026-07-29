@@ -21,9 +21,21 @@ export function getDb(): Database.Database {
   db.pragma('foreign_keys = ON');
 
   db.exec(readSchema());
+  runMigrations(db);
 
   dbInstance = db;
   return db;
+}
+
+// Handles schema changes that CREATE TABLE IF NOT EXISTS cannot apply to an
+// already-existing database, while staying safe to run repeatedly in both
+// production and tests.
+export function runMigrations(db: Database.Database): void {
+  const columns = db.prepare('PRAGMA table_info(pull_requests)').all() as { name: string }[];
+  const hasClosedAt = columns.some((c) => c.name === 'closed_at');
+  if (!hasClosedAt) {
+    db.exec('ALTER TABLE pull_requests ADD COLUMN closed_at TEXT');
+  }
 }
 
 // `__dirname` is not reliable here: Next.js bundles/transpiles server code
@@ -41,5 +53,6 @@ export function createTestDb(): Database.Database {
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
   db.exec(readSchema());
+  runMigrations(db);
   return db;
 }

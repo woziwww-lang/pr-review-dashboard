@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (
   last_attempted_at TEXT,
   raw_report_md TEXT,
   error_message TEXT,
+  closed_at TEXT,
   UNIQUE(repo, pr_number)
 );
 
