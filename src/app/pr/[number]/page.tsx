@@ -7,6 +7,7 @@ import { getByNumber } from '../../../db/pullRequests';
 import { getFindingsByPrId } from '../../../db/findings';
 import { buildDetailPageViewModel } from '../../../lib/detailPageViewModel';
 import { buildSeveritySummary } from '../../../lib/severitySummary';
+import { PrStateBadge } from '../../components/PrStateBadge';
 import { VerdictBadge } from '../../components/VerdictBadge';
 import { FindingCard } from '../../components/FindingCard';
 import { HoverLiftCard } from '../../components/HoverLiftCard';
@@ -33,7 +34,7 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
   // field - `pr` (the raw PullRequestRow) is already in scope here from
   // getByNumber() above, so no view-model shape change is needed to
   // give RecheckButton the in-progress signal it needs to disable itself.
-  const isInProgress = pr.review_status === 'pending' || pr.review_status === 'reviewing';
+  const isInProgress = pr.pr_state === 'open' && (pr.review_status === 'pending' || pr.review_status === 'reviewing');
   const severitySummary = buildSeveritySummary([pr]);
 
   return (
@@ -48,8 +49,9 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
           <span className="font-mono text-muted-foreground">#{vm.prNumber}</span> {vm.title}
         </h1>
         <div className="flex items-center gap-3">
+          {vm.prState !== 'open' && <PrStateBadge state={vm.prState} />}
           {!vm.failureBanner && <TimeStamp iso={pr.last_reviewed_at} label="Last reviewed" />}
-          <RecheckButton prNumber={vm.prNumber} disabled={isInProgress} />
+          {vm.prState === 'open' && <RecheckButton prNumber={vm.prNumber} disabled={isInProgress} />}
         </div>
       </div>
 

@@ -14,11 +14,13 @@ export interface DetailPageViewModel {
   state: DetailPageState;
   prNumber: number;
   title: string;
+  prState: 'open' | 'merged' | 'closed';
   verdict: string | null;
   severityCritical: number;
   severityHigh: number;
   severityMedium: number;
   severityLow: number;
+  closedAt: string | null;
   topRisks: FindingRow[];
   mediumLow: FindingRow[];
   rawReportMd: string | null;
@@ -45,11 +47,13 @@ export function buildDetailPageViewModel(pr: PullRequestRow, findings: FindingRo
     state,
     prNumber: pr.pr_number,
     title: pr.title,
+    prState: pr.pr_state,
     verdict: pr.verdict,
     severityCritical: pr.severity_critical,
     severityHigh: pr.severity_high,
     severityMedium: pr.severity_medium,
     severityLow: pr.severity_low,
+    closedAt: pr.closed_at,
     topRisks: showFindings ? findings.filter((f) => f.severity === 'CRITICAL' || f.severity === 'HIGH') : [],
     mediumLow: showFindings ? findings.filter((f) => f.severity === 'MEDIUM' || f.severity === 'LOW') : [],
     rawReportMd: showFindings ? pr.raw_report_md : null,

@@ -100,4 +100,14 @@ describe('buildDetailPageViewModel', () => {
     expect(vm.mediumLow).toHaveLength(0);
     expect(vm.rawReportMd).toBeNull();
   });
+
+  it('passes prState through into the view model', () => {
+    const vm = buildDetailPageViewModel(prRow({ pr_state: 'merged' }), []);
+    expect(vm.prState).toBe('merged');
+  });
+
+  it('passes closedAt through into the view model', () => {
+    const vm = buildDetailPageViewModel(prRow({ pr_state: 'closed', closed_at: '2026-07-29T10:00:00.000Z' }), []);
+    expect(vm.closedAt).toBe('2026-07-29T10:00:00.000Z');
+  });
 });
