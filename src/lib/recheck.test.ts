@@ -51,6 +51,22 @@ describe('forceRecheck', () => {
     expect(fetchOpenPrsMock).not.toHaveBeenCalled();
   });
 
+  it.each(['merged', 'closed'] as const)(
+    'returns not-found for a %s PR, even if review_status is still pending (defensive guard; UI never shows Re-check for these)',
+    async (prState) => {
+      upsertOpenPr(db, {
+        repo: 'owner/name', prNumber: 1, title: 't', author: 'a', branch: 'b',
+        baseBranch: 'main', headSha: 'sha1', prUrl: 'u', isDraft: false,
+      });
+      db.prepare("UPDATE pull_requests SET pr_state = ?, closed_at = datetime('now') WHERE pr_number = 1").run(prState);
+
+      const result = await forceRecheck(db, 'owner/name', 1);
+
+      expect(result).toEqual({ status: 'not-found' });
+      expect(fetchOpenPrsMock).not.toHaveBeenCalled();
+    }
+  );
+
   it('returns not-found when the PR is no longer in the fresh gh pr list (closed/merged)', async () => {
     upsertOpenPr(db, {
       repo: 'owner/name', prNumber: 1, title: 't', author: 'a', branch: 'b',

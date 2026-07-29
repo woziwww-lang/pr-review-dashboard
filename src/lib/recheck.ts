@@ -18,6 +18,7 @@ export async function forceRecheck(
 ): Promise<RecheckOutcome> {
   const existing = getByNumber(db, repo, prNumber);
   if (!existing) return { status: 'not-found' };
+  if (existing.pr_state !== 'open') return { status: 'not-found' };
   if (existing.review_status === 'pending' || existing.review_status === 'reviewing') {
     return { status: 'already-in-progress' };
   }
