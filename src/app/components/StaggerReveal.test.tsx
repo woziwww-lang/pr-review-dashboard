@@ -4,10 +4,16 @@ import { render, screen } from '@testing-library/react';
 import { StaggerReveal } from './StaggerReveal';
 
 const fromMock = vi.fn();
+const killMock = vi.fn();
+const setMock = vi.fn();
 
 vi.mock('gsap', () => ({
   gsap: {
-    from: (...args: unknown[]) => fromMock(...args),
+    from: (...args: unknown[]) => {
+      fromMock(...args);
+      return { kill: killMock };
+    },
+    set: (...args: unknown[]) => setMock(...args),
   },
 }));
 
@@ -23,6 +29,8 @@ function mockMatchMedia(reduceMotion: boolean) {
 describe('StaggerReveal', () => {
   beforeEach(() => {
     fromMock.mockClear();
+    killMock.mockClear();
+    setMock.mockClear();
   });
 
   afterEach(() => {
@@ -62,5 +70,37 @@ describe('StaggerReveal', () => {
       </StaggerReveal>
     );
     expect(fromMock).not.toHaveBeenCalled();
+  });
+
+  it('kills the tween and clears inline styles on unmount', () => {
+    mockMatchMedia(false);
+    const { unmount } = render(
+      <StaggerReveal>
+        <div>first</div>
+        <div>second</div>
+      </StaggerReveal>
+    );
+    setMock.mockClear();
+    unmount();
+    expect(killMock).toHaveBeenCalledTimes(1);
+    expect(setMock).toHaveBeenCalledWith(expect.anything(), { clearProps: 'opacity,transform' });
+  });
+
+  it('force-clears inline styles via the safety-net timer if the tween never unmounts or completes', () => {
+    vi.useFakeTimers();
+    mockMatchMedia(false);
+    render(
+      <StaggerReveal>
+        <div>first</div>
+        <div>second</div>
+      </StaggerReveal>
+    );
+    setMock.mockClear();
+    expect(setMock).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(1000);
+
+    expect(setMock).toHaveBeenCalledWith(expect.anything(), { clearProps: 'opacity,transform' });
+    vi.useRealTimers();
   });
 });
