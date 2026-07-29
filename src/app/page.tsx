@@ -4,6 +4,7 @@ import { getConfig } from '../db/config';
 import { getVisiblePrs } from '../db/pullRequests';
 import { buildListPageViewModel } from '../lib/listPageViewModel';
 import { buildSeveritySummary } from '../lib/severitySummary';
+import { PrStateBadge } from './components/PrStateBadge';
 import { VerdictBadge } from './components/VerdictBadge';
 import { PollStatusBanner } from './components/PollStatusBanner';
 import { RecheckButton } from './components/RecheckButton';
@@ -26,7 +27,7 @@ export default function ListPage() {
     lastPollError: getConfig(db, 'last_poll_error') ?? null,
     prs: visiblePrs,
   });
-  const severitySummary = buildSeveritySummary(visiblePrs);
+  const severitySummary = buildSeveritySummary(visiblePrs.filter((pr) => pr.pr_state === 'open'));
 
   return (
     <main className="mx-auto flex max-w-4xl flex-col gap-6 px-6 py-10">
@@ -43,7 +44,7 @@ export default function ListPage() {
           <HoverLiftCard key={row.prNumber}>
             <Card
               className={`relative flex flex-col items-stretch gap-3 card-glass p-4 transition-colors duration-200 ease-out hover:border-primary/40 sm:flex-row sm:items-center sm:justify-between ${
-                row.isInProgress ? 'opacity-70' : ''
+                row.isInProgress ? 'opacity-70' : row.prState !== 'open' ? 'opacity-60' : ''
               }`}
             >
               {/* Full-card clickable overlay: an absolutely-positioned
@@ -88,6 +89,7 @@ export default function ListPage() {
                 </div>
 
                 <div className="flex items-center gap-4">
+                  {row.prState !== 'open' && <PrStateBadge state={row.prState} />}
                   {row.isInProgress ? (
                     <span className="flex items-center gap-2 text-sm text-muted-foreground">
                       <span className="h-2 w-2 animate-pulse rounded-full bg-primary" />
@@ -106,9 +108,11 @@ export default function ListPage() {
                 </div>
               </div>
 
-              <div className="relative z-10 pointer-events-auto">
-                <RecheckButton prNumber={row.prNumber} disabled={row.isInProgress} />
-              </div>
+              {row.prState === 'open' && (
+                <div className="relative z-10 pointer-events-auto">
+                  <RecheckButton prNumber={row.prNumber} disabled={row.isInProgress} />
+                </div>
+              )}
             </Card>
           </HoverLiftCard>
         ))}
