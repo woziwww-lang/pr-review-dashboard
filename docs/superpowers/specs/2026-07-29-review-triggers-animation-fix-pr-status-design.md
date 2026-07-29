@@ -101,24 +101,77 @@ pattern should be considered if a similar bug is ever reported for it.
   convention change).
 - Existing databases get a small idempotent migration (checked via
   `PRAGMA table_info(pull_requests)`, then `ALTER TABLE ... ADD COLUMN` if
-  missing) run from `src/db/client.ts` alongside the existing
-  `db.exec(readSchema())` call, so current production data isn't lost.
+  missing), extracted into a shared `runMigrations(db)` helper in
+  `src/db/client.ts` that is called from **both** `getDb()` and
+  `createTestDb()` (both currently call `db.exec(readSchema())` directly —
+  see `src/db/client.ts:13-23,40-43` — so both call sites must run the
+  migration to keep production and test databases consistent).
+- `PullRequestRow`'s `pr_state` type (`src/db/pullRequests.ts:26`) is widened
+  from `'open' | 'closed'` to `'open' | 'merged' | 'closed'`, and a
+  `closed_at: string | null` field is added to match the new column.
+- `src/lib/gh.ts` gets a new exported helper, e.g.
+  `getPrFinalState(repo, prNumber): Promise<'merged' | 'closed'>`, wrapping
+  `gh pr view <number> --repo <repo> --json state` (mapping GitHub's
+  `MERGED`/`CLOSED` to our lowercase `pr_state` values), following the same
+  `execFileAsync` pattern already used by `fetchOpenPrs` in that file.
 
 ### Poller changes (`src/lib/poller.ts`, `src/db/pullRequests.ts`)
 
 - When a previously-tracked **open** PR no longer appears in
-  `gh pr list --state open`'s results, look up its real final state via
-  `gh pr view <number> --repo <repo> --json state` (`MERGED` vs `CLOSED`) and
-  set `pr_state` (`'merged'`/`'closed'`) + `closed_at = now` on that row,
-  instead of unconditionally marking everything `'closed'` as today.
+  `gh pr list --state open`'s results, call the new `getPrFinalState()`
+  helper and set `pr_state` (`'merged'`/`'closed'`) + `closed_at = now` on
+  that row, instead of unconditionally marking everything `'closed'` as
+  today.
+- **Queued/in-flight interaction**: `runPollTick()` calls
+  `markClosedExcept()` and then still runs `processQueue()` →
+  `getPendingPrs()` in the same tick (`src/lib/poller.ts:68,80`), and
+  `getPendingPrs()` currently ignores `pr_state` entirely
+  (`src/db/pullRequests.ts:123`). To avoid reviewing a PR that just got
+  merged/closed in this same tick, `getPendingPrs()` is updated to only
+  return rows where `pr_state = 'open'`. A PR that is already
+  `'reviewing'` (child process already spawned) when it merges/closes is
+  allowed to finish naturally — its result is still valid historical data
+  for the retention window; nothing needs to detect/cancel that in-flight
+  process.
+- **A row can still be left with `review_status='pending'` when it
+  merges/closes** (e.g. it was enqueued for a commit change, then the PR
+  merged before `processQueue()` reached it). Rather than inventing a new
+  synthetic terminal `review_status` value for this case, all
+  "in progress" / recheck-eligibility checks are gated on `pr_state`
+  in addition to `review_status`, so a stale `'pending'` on a
+  merged/closed row can never present as active:
+  - `buildListRowViewModel` (`src/lib/listPageViewModel.ts:28`) and the
+    detail page's `isInProgress` computation
+    (`src/app/pr/[number]/page.tsx:36`) both change their check from
+    `reviewStatus === 'pending' || reviewStatus === 'reviewing'` to also
+    require `prState === 'open'` — a merged/closed PR is therefore never
+    rendered as "Reviewing…", regardless of its stored `review_status`.
+    This requires plumbing `prState` through: `ListPageRowInput` and
+    `ListPageRowViewModel` (`src/lib/listPageViewModel.ts:4-13`) both gain
+    a `prState` field, and `buildListPageViewModel` (lines 77-88) passes
+    `pr.pr_state` through when constructing each row's input, same as it
+    already does for `reviewStatus`, `verdict`, etc.
+  - `forceRecheck` (`src/lib/recheck.ts:21`) adds a `prState === 'open'`
+    guard before its existing "already-in-progress" check, returning the
+    existing `not-found`-style outcome for merged/closed PRs instead of a
+    misleading `already-in-progress` (409). This is a defensive backstop
+    only — the "Re-check now" button is already hidden for merged/closed
+    PRs per the UI changes below, so this path shouldn't normally be
+    reachable from the UI.
 - On every poll tick, **hard-delete** rows where `pr_state` is `'merged'` or
   `'closed'` and `closed_at` is more than 3 days old. `findings` rows for
   that PR cascade-delete automatically via the existing
   `ON DELETE CASCADE` foreign key — no separate cleanup needed there.
 - `getOpenPrs` is renamed to `getVisiblePrs` and returns rows where
-  `pr_state = 'open'` OR (`pr_state IN ('merged','closed')` AND
-  `closed_at` is within the last 3 days), keeping the existing
-  `ORDER BY pr_number DESC`.
+  `is_draft = 0` AND (`pr_state = 'open'` OR (`pr_state IN ('merged','closed')`
+  AND `closed_at` is within the last 3 days)), keeping both the existing
+  `is_draft = 0` filter (`src/db/pullRequests.ts:99-100` — drafts stay
+  excluded entirely, per Non-goals below) and the existing
+  `ORDER BY pr_number DESC`. A separate, narrower `getOpenPrs` query (or an
+  inline filter on `getVisiblePrs`'s result) is still used specifically for
+  `buildSeveritySummary()` in `src/app/page.tsx:21-29` — the top summary bar
+  continues to reflect **open PRs only**, so a merged/closed PR lingering
+  in the retention window doesn't skew the live severity counts.
 
 ### UI changes
 
