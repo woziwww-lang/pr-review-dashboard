@@ -87,7 +87,7 @@ export function buildListPageViewModel(input: ListPageViewModelInput): ListPageV
           lastReviewedAt: pr.last_reviewed_at,
         })
       )
-      // `getOpenPrs()` (db/pullRequests.ts) already queries with
+      // `getVisiblePrs()` (db/pullRequests.ts) already queries with
       // `ORDER BY pr_number DESC`, but this view model re-sorts
       // defensively rather than trusting caller ordering, since it's a
       // pure function that may be called with data from other sources

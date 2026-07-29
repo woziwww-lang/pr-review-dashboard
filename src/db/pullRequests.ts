@@ -38,13 +38,15 @@ export interface PullRequestRow {
   closed_at: string | null;
 }
 
+type FinalPrState = Exclude<PullRequestRow['pr_state'], 'open'>;
+
 /**
  * Syncs one PR's metadata from `gh pr list` into the database. This is a
  * pure metadata sync, NOT an enqueue decision:
  * - On INSERT (first time this PR is seen), `review_status` starts at the
  *   schema default `'pending'` — including for drafts. That's harmless:
  *   a draft's row just sits at `pending` indefinitely because it's
- *   filtered out of `getOpenPrs()` (see below), the Chunk 3 poller's
+ *   filtered out of `getVisiblePrs()` (see below), the Chunk 3 poller's
  *   enqueue decision explicitly skips any row with `is_draft=1`
  *   regardless of `review_status`, and `resetStuckReviews()` (below)
  *   likewise excludes `is_draft=1` rows and never touches `'pending'` rows
@@ -77,30 +79,70 @@ export function upsertOpenPr(db: Database.Database, pr: OpenPrInput): void {
 export function markClosedExcept(
   db: Database.Database,
   repo: string,
-  keepPrNumbers: number[]
+  keepPrNumbers: number[],
+  finalStates: Record<number, FinalPrState> = {}
 ): void {
+  const closedAt = new Date().toISOString();
+  const buildStateCase = (prNumbers: number[]) =>
+    prNumbers.length === 0
+      ? `'closed'`
+      : `CASE pr_number ${prNumbers
+        .map((prNumber) => `WHEN ${prNumber} THEN '${finalStates[prNumber] ?? 'closed'}'`)
+        .join(' ')} ELSE 'closed' END`;
+
   if (keepPrNumbers.length === 0) {
+    const finalStateNumbers = Object.keys(finalStates).map(Number);
+    const stateCase = buildStateCase(finalStateNumbers);
     // No PRs currently open for this repo (or gh returned an empty list):
-    // close everything. `NOT IN ()` is invalid SQL and `NOT IN (NULL)`
-    // silently matches nothing in SQLite, so this case must be handled
-    // separately rather than falling through to the parameterized query.
-    db.prepare(`UPDATE pull_requests SET pr_state = 'closed' WHERE repo = ?`).run(repo);
+    // close every still-open tracked row. `NOT IN ()` is invalid SQL, so
+    // this case must be handled separately rather than falling through to
+    // the parameterized query.
+    db.prepare(
+      `UPDATE pull_requests
+       SET pr_state = ${stateCase},
+           closed_at = @closedAt
+       WHERE repo = @repo AND pr_state = 'open'`
+    ).run({ repo, closedAt });
     return;
   }
+
+  const closingPrNumbers = Array.from(new Set(
+    db.prepare(
+      `SELECT pr_number FROM pull_requests
+       WHERE repo = ? AND pr_state = 'open' AND pr_number NOT IN (${keepPrNumbers.map(() => '?').join(',')})`
+    ).all(repo, ...keepPrNumbers).map((row) => (row as { pr_number: number }).pr_number)
+  ));
+  const stateCase = buildStateCase(closingPrNumbers);
   const placeholders = keepPrNumbers.map(() => '?').join(',');
   db.prepare(
-    `UPDATE pull_requests SET pr_state = 'closed'
-     WHERE repo = ? AND pr_number NOT IN (${placeholders})`
-  ).run(repo, ...keepPrNumbers);
+    `UPDATE pull_requests
+     SET pr_state = ${stateCase},
+         closed_at = ?
+     WHERE repo = ? AND pr_state = 'open' AND pr_number NOT IN (${placeholders})`
+  ).run(closedAt, repo, ...keepPrNumbers);
 }
 
-export function getOpenPrs(db: Database.Database, repo: string): PullRequestRow[] {
+export function getVisiblePrs(
+  db: Database.Database,
+  repo: string,
+  retentionDays = 3,
+  nowIso = new Date().toISOString()
+): PullRequestRow[] {
   return db
     .prepare(
-      `SELECT * FROM pull_requests WHERE repo = ? AND pr_state = 'open' AND is_draft = 0
+      `SELECT * FROM pull_requests
+       WHERE repo = ? AND is_draft = 0
+         AND (
+           pr_state = 'open'
+           OR (
+             pr_state IN ('merged', 'closed')
+             AND closed_at IS NOT NULL
+             AND datetime(closed_at) > datetime(?, '-' || ? || ' days')
+           )
+         )
        ORDER BY pr_number DESC`
     )
-    .all(repo) as PullRequestRow[];
+    .all(repo, nowIso, retentionDays) as PullRequestRow[];
 }
 
 export function getByNumber(
@@ -121,10 +163,27 @@ export function getByNumber(
 export function getPendingPrs(db: Database.Database, repo: string): PullRequestRow[] {
   return db
     .prepare(
-      `SELECT * FROM pull_requests WHERE repo = ? AND review_status = 'pending' AND is_draft = 0
+      `SELECT * FROM pull_requests
+       WHERE repo = ? AND pr_state = 'open' AND review_status = 'pending' AND is_draft = 0
        ORDER BY id ASC`
     )
     .all(repo) as PullRequestRow[];
+}
+
+export function deleteStaleClosedPrs(
+  db: Database.Database,
+  retentionDays = 3,
+  nowIso = new Date().toISOString()
+): number {
+  const result = db
+    .prepare(
+      `DELETE FROM pull_requests
+       WHERE pr_state != 'open'
+         AND closed_at IS NOT NULL
+         AND datetime(closed_at) <= datetime(?, '-' || ? || ' days')`
+    )
+    .run(nowIso, retentionDays);
+  return result.changes;
 }
 
 export function markReviewing(db: Database.Database, id: number): void {

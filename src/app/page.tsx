@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { getDb } from '../db/client';
 import { getConfig } from '../db/config';
-import { getOpenPrs } from '../db/pullRequests';
+import { getVisiblePrs } from '../db/pullRequests';
 import { buildListPageViewModel } from '../lib/listPageViewModel';
 import { buildSeveritySummary } from '../lib/severitySummary';
 import { VerdictBadge } from './components/VerdictBadge';
@@ -18,15 +18,15 @@ export const dynamic = 'force-dynamic';
 export default function ListPage() {
   const db = getDb();
   const repo = getConfig(db, 'target_repo') ?? '(not configured)';
-  const openPrs = getOpenPrs(db, repo);
+  const visiblePrs = getVisiblePrs(db, repo);
   const vm = buildListPageViewModel({
     repo,
     lastPollAt: getConfig(db, 'last_poll_at') ?? null,
     lastPollStatus: (getConfig(db, 'last_poll_status') as 'ok' | 'error' | undefined) ?? null,
     lastPollError: getConfig(db, 'last_poll_error') ?? null,
-    prs: openPrs,
+    prs: visiblePrs,
   });
-  const severitySummary = buildSeveritySummary(openPrs);
+  const severitySummary = buildSeveritySummary(visiblePrs);
 
   return (
     <main className="mx-auto flex max-w-4xl flex-col gap-6 px-6 py-10">

@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import { fetchOpenPrs } from './gh';
+import { fetchOpenPrs, getPrFinalState } from './gh';
 import { ensureBareRepo, addOrUpdateWorktree, resolveLocalBaseSha } from './repoCache';
 import { runReview } from './reviewRunner';
 import { buildReviewPrompt } from './reviewPrompt';
@@ -15,12 +15,18 @@ import {
   markFailed,
   getByNumber,
   getPendingPrs,
+  deleteStaleClosedPrs,
 } from '../db/pullRequests';
 import { replaceFindings, type FindingInput } from '../db/findings';
 
 const REVIEW_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes, per spec
 
 export async function runPollTick(db: Database.Database, repo: string): Promise<void> {
+  const previouslyOpenPrNumbers = (
+    db.prepare(`SELECT pr_number FROM pull_requests WHERE repo = ? AND pr_state = 'open'`).all(repo) as
+      { pr_number: number }[]
+  ).map((row) => row.pr_number);
+
   let prs;
   try {
     prs = await fetchOpenPrs(repo);
@@ -30,6 +36,7 @@ export async function runPollTick(db: Database.Database, repo: string): Promise<
     return; // this tick's upsert/close/enqueue step is skipped entirely
   }
 
+  const finalStates: Record<number, 'merged' | 'closed'> = {};
   const keepPrNumbers: number[] = [];
   for (const pr of prs) {
     keepPrNumbers.push(pr.number);
@@ -65,7 +72,18 @@ export async function runPollTick(db: Database.Database, repo: string): Promise<
     }
   }
 
-  markClosedExcept(db, repo, keepPrNumbers);
+  const keepPrNumberSet = new Set(keepPrNumbers);
+  for (const prNumber of previouslyOpenPrNumbers) {
+    if (keepPrNumberSet.has(prNumber)) continue;
+    try {
+      finalStates[prNumber] = await getPrFinalState(repo, prNumber);
+    } catch {
+      finalStates[prNumber] = 'closed';
+    }
+  }
+
+  markClosedExcept(db, repo, keepPrNumbers, finalStates);
+  deleteStaleClosedPrs(db);
   setConfig(db, 'last_poll_at', new Date().toISOString());
   setConfig(db, 'last_poll_status', 'ok');
   setConfig(db, 'last_poll_error', '');

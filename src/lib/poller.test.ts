@@ -1,11 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createTestDb } from '../db/client';
-import { getByNumber, getOpenPrs } from '../db/pullRequests';
+import { getByNumber, getVisiblePrs } from '../db/pullRequests';
 import { getConfig } from '../db/config';
 import { getFindingsByPrId } from '../db/findings';
 
 const fetchOpenPrsMock = vi.fn();
-vi.mock('./gh', () => ({ fetchOpenPrs: (...args: unknown[]) => fetchOpenPrsMock(...args) }));
+const getPrFinalStateMock = vi.fn();
+vi.mock('./gh', () => ({
+  fetchOpenPrs: (...args: unknown[]) => fetchOpenPrsMock(...args),
+  getPrFinalState: (...args: unknown[]) => getPrFinalStateMock(...args),
+}));
 
 const ensureBareRepoMock = vi.fn().mockResolvedValue(undefined);
 const addOrUpdateWorktreeMock = vi.fn().mockResolvedValue('/tmp/worktrees/pr-1');
@@ -38,6 +42,7 @@ describe('runPollTick', () => {
   beforeEach(() => {
     db = createTestDb();
     fetchOpenPrsMock.mockReset();
+    getPrFinalStateMock.mockReset();
     ensureBareRepoMock.mockClear();
     addOrUpdateWorktreeMock.mockClear();
     resolveLocalBaseShaMock.mockClear();
@@ -71,7 +76,7 @@ describe('runPollTick', () => {
     const row = getByNumber(db, 'owner/name', 1)!;
     expect(row.review_status).toBe('pending'); // insert default, never actually run
     expect(runReviewMock).not.toHaveBeenCalled();
-    expect(getOpenPrs(db, 'owner/name')).toEqual([]); // filtered out of the visible list
+    expect(getVisiblePrs(db, 'owner/name')).toEqual([]); // filtered out of the visible list
   });
 
   it('re-reviews an existing PR when head_sha changed, storing new findings and clearing old ones', async () => {
@@ -145,7 +150,7 @@ describe('runPollTick', () => {
     expect(row.review_status).toBe('done'); // untouched by the failed poll
   });
 
-  it('marks PRs absent from the gh result as closed', async () => {
+  it('resolves disappeared PRs to their final merged/closed state', async () => {
     fetchOpenPrsMock.mockResolvedValueOnce([basePrFromGh]);
     runReviewMock.mockResolvedValue({
       success: true,
@@ -154,8 +159,50 @@ describe('runPollTick', () => {
     await runPollTick(db, 'owner/name');
 
     fetchOpenPrsMock.mockResolvedValueOnce([]); // PR #1 merged/closed upstream
+    getPrFinalStateMock.mockResolvedValueOnce('merged');
     await runPollTick(db, 'owner/name');
 
-    expect(getByNumber(db, 'owner/name', 1)!.pr_state).toBe('closed');
+    const row = getByNumber(db, 'owner/name', 1)!;
+    expect(getPrFinalStateMock).toHaveBeenCalledWith('owner/name', 1);
+    expect(row.pr_state).toBe('merged');
+    expect(row.closed_at).toBeTruthy();
+  });
+
+  it('falls back to closed when resolving a disappeared PR final state throws', async () => {
+    fetchOpenPrsMock.mockResolvedValueOnce([basePrFromGh]);
+    runReviewMock.mockResolvedValue({
+      success: true,
+      output: `# R\n\n\`\`\`json\n{"verdict": "approve", "findings": []}\n\`\`\`\n`,
+    });
+    await runPollTick(db, 'owner/name');
+
+    fetchOpenPrsMock.mockResolvedValueOnce([]);
+    getPrFinalStateMock.mockRejectedValueOnce(new Error('unexpected pr state'));
+    await runPollTick(db, 'owner/name');
+
+    const row = getByNumber(db, 'owner/name', 1)!;
+    expect(row.pr_state).toBe('closed');
+    expect(row.closed_at).toBeTruthy();
+  });
+
+  it('deletes stale closed PRs after each poll tick', async () => {
+    fetchOpenPrsMock.mockResolvedValueOnce([basePrFromGh]);
+    runReviewMock.mockResolvedValue({
+      success: true,
+      output: `# R\n\n\`\`\`json\n{"verdict": "approve", "findings": []}\n\`\`\`\n`,
+    });
+    await runPollTick(db, 'owner/name');
+
+    fetchOpenPrsMock.mockResolvedValueOnce([]);
+    getPrFinalStateMock.mockResolvedValueOnce('closed');
+    await runPollTick(db, 'owner/name');
+
+    db.prepare(`UPDATE pull_requests SET closed_at = '2026-07-01T00:00:00.000Z' WHERE repo = ? AND pr_number = ?`)
+      .run('owner/name', 1);
+
+    fetchOpenPrsMock.mockResolvedValueOnce([]);
+    await runPollTick(db, 'owner/name');
+
+    expect(getByNumber(db, 'owner/name', 1)).toBeUndefined();
   });
 });

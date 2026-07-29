@@ -8,10 +8,11 @@ import {
   markDone,
   markFailed,
   markPending,
-  getOpenPrs,
+  getVisiblePrs,
   getByNumber,
   getPendingPrs,
   resetStuckReviews,
+  deleteStaleClosedPrs,
   type OpenPrInput,
 } from './pullRequests';
 
@@ -60,6 +61,17 @@ describe('pullRequests repository', () => {
     expect(getByNumber(db, 'owner/name', 2)!.pr_state).toBe('closed');
   });
 
+  it('marks PRs not in the keep-list with their resolved final state and stamps closed_at', () => {
+    upsertOpenPr(db, basePr);
+    upsertOpenPr(db, { ...basePr, prNumber: 2 });
+
+    markClosedExcept(db, 'owner/name', [1], { 2: 'merged' });
+
+    const row = getByNumber(db, 'owner/name', 2)!;
+    expect(row.pr_state).toBe('merged');
+    expect(row.closed_at).toBeTruthy();
+  });
+
   it('closes every tracked PR when the keep-list is empty (e.g. gh returned zero open PRs)', () => {
     upsertOpenPr(db, basePr);
     upsertOpenPr(db, { ...basePr, prNumber: 2 });
@@ -70,14 +82,31 @@ describe('pullRequests repository', () => {
     expect(getByNumber(db, 'owner/name', 2)!.pr_state).toBe('closed');
   });
 
-  it('getOpenPrs only returns pr_state=open and is_draft=0', () => {
+  it('getVisiblePrs keeps open PRs and only recently closed/merged non-draft PRs within retention', () => {
     upsertOpenPr(db, basePr);
     upsertOpenPr(db, { ...basePr, prNumber: 2, isDraft: true });
     upsertOpenPr(db, { ...basePr, prNumber: 3 });
-    markClosedExcept(db, 'owner/name', [1, 2]);
+    upsertOpenPr(db, { ...basePr, prNumber: 4 });
+    upsertOpenPr(db, { ...basePr, prNumber: 5 });
+    markClosedExcept(db, 'owner/name', [1, 2], { 3: 'closed', 4: 'merged' });
+    markClosedExcept(db, 'owner/name', [1, 2, 3, 4], { 5: 'closed' });
 
-    const open = getOpenPrs(db, 'owner/name');
-    expect(open.map((r) => r.pr_number)).toEqual([1]);
+    db.prepare(
+      `UPDATE pull_requests
+       SET closed_at = CASE pr_number
+         WHEN 3 THEN '2026-07-28T20:00:00.000Z'
+         WHEN 4 THEN '2026-07-27T20:00:00.000Z'
+         WHEN 5 THEN '2026-07-25T19:59:59.000Z'
+         ELSE closed_at
+       END`
+    ).run();
+
+    const visible = getVisiblePrs(db, 'owner/name', 3, '2026-07-29T20:00:00.000Z');
+    expect(visible.map((r) => [r.pr_number, r.pr_state])).toEqual([
+      [4, 'merged'],
+      [3, 'closed'],
+      [1, 'open'],
+    ]);
   });
 
   it('metadata-only update (same head_sha) does not reset review_status back to pending', () => {
@@ -209,16 +238,43 @@ describe('pullRequests repository', () => {
     expect(pending.raw_report_md).toBe('# ok'); // preserved
   });
 
-  it('getPendingPrs returns only pending, non-draft rows for the given repo, oldest first', () => {
+  it('getPendingPrs returns only pending, open, non-draft rows for the given repo, oldest first', () => {
     upsertOpenPr(db, basePr); // pending
     upsertOpenPr(db, { ...basePr, prNumber: 2 });
     markReviewing(db, getByNumber(db, 'owner/name', 2)!.id); // not pending anymore
     upsertOpenPr(db, { ...basePr, prNumber: 3 }); // pending
+    markClosedExcept(db, 'owner/name', [1, 2, 4, 5], { 3: 'merged' }); // closed/merged rows must not be re-queued
     upsertOpenPr(db, { ...basePr, prNumber: 4, isDraft: true }); // pending but a draft — never queued
     upsertOpenPr(db, { ...basePr, repo: 'other/repo', prNumber: 1 }); // different repo
 
     const pending = getPendingPrs(db, 'owner/name');
 
-    expect(pending.map((r) => r.pr_number)).toEqual([1, 3]);
+    expect(pending.map((r) => r.pr_number)).toEqual([1]);
+  });
+
+  it('deleteStaleClosedPrs deletes non-open rows at or older than the retention cutoff', () => {
+    upsertOpenPr(db, basePr);
+    upsertOpenPr(db, { ...basePr, prNumber: 2 });
+    upsertOpenPr(db, { ...basePr, prNumber: 3 });
+    upsertOpenPr(db, { ...basePr, prNumber: 4 });
+    markClosedExcept(db, 'owner/name', [1], { 2: 'closed', 3: 'merged', 4: 'closed' });
+
+    db.prepare(
+      `UPDATE pull_requests
+       SET closed_at = CASE pr_number
+         WHEN 2 THEN '2026-07-26T20:00:00.000Z'
+         WHEN 3 THEN '2026-07-29T08:00:00.000Z'
+         WHEN 4 THEN '2026-07-26T19:59:59.000Z'
+         ELSE closed_at
+       END`
+    ).run();
+
+    const deleted = deleteStaleClosedPrs(db, 3, '2026-07-29T20:00:00.000Z');
+
+    expect(deleted).toBe(2);
+    expect(getByNumber(db, 'owner/name', 1)).toBeTruthy();
+    expect(getByNumber(db, 'owner/name', 2)).toBeUndefined();
+    expect(getByNumber(db, 'owner/name', 3)?.pr_state).toBe('merged');
+    expect(getByNumber(db, 'owner/name', 4)).toBeUndefined();
   });
 });
