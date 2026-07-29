@@ -9,10 +9,12 @@ function row(overrides: Partial<ListPageRowInput>): ListPageRowInput {
     branch: 'feat/x',
     author: 'alice',
     reviewStatus: 'done',
+    prState: 'open',
     verdict: 'approve',
     severityCritical: 0,
     severityHigh: 0,
     lastReviewedAt: '2026-07-28T00:00:00.000Z',
+    closedAt: null,
     ...overrides,
   };
 }
@@ -28,6 +30,27 @@ describe('buildListRowViewModel', () => {
   it('shows an in-progress indicator for a reviewing row', () => {
     const vm = buildListRowViewModel(row({ reviewStatus: 'reviewing' }));
     expect(vm.isInProgress).toBe(true);
+  });
+
+  it('is never in-progress for a merged PR, even if review_status is still pending', () => {
+    const vm = buildListRowViewModel(row({ reviewStatus: 'pending', prState: 'merged' }));
+    expect(vm.isInProgress).toBe(false);
+    expect(vm.prState).toBe('merged');
+  });
+
+  it('is in-progress for an open PR with review_status reviewing', () => {
+    const vm = buildListRowViewModel(row({ reviewStatus: 'reviewing', prState: 'open' }));
+    expect(vm.isInProgress).toBe(true);
+  });
+
+  it('marks a closed PR as such in the view model', () => {
+    const vm = buildListRowViewModel(row({ prState: 'closed', reviewStatus: 'done' }));
+    expect(vm.prState).toBe('closed');
+  });
+
+  it('passes closedAt through into the row view model', () => {
+    const vm = buildListRowViewModel(row({ closedAt: '2026-07-29T00:00:00.000Z', prState: 'merged' }));
+    expect(vm.closedAt).toBe('2026-07-29T00:00:00.000Z');
   });
 
   it('shows a failed badge and last successful counts when a prior review exists', () => {
@@ -88,7 +111,23 @@ describe('buildListPageViewModel', () => {
     });
     expect(vm.repo).toBe('owner/name');
     expect(vm.rows.map((r) => r.prNumber)).toEqual([2, 1]);
+    expect(vm.rows[0]?.prState).toBe('open');
     expect(vm.pollStatus).toBe('ok');
+  });
+
+  it('maps pr_state and closed_at from DB rows into row view models', () => {
+    const vm = buildListPageViewModel({
+      repo: 'owner/name',
+      lastPollAt: '2026-07-28T00:05:00.000Z',
+      lastPollStatus: 'ok',
+      lastPollError: null,
+      prs: [prRow({ pr_state: 'merged', closed_at: '2026-07-29T00:00:00.000Z' })],
+    });
+    expect(vm.rows[0]).toMatchObject({
+      prState: 'merged',
+      closedAt: '2026-07-29T00:00:00.000Z',
+      isInProgress: false,
+    });
   });
 
   it('propagates a failed poll error message into the view model', () => {

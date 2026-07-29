@@ -7,10 +7,12 @@ export interface ListPageRowInput {
   branch: string;
   author: string;
   reviewStatus: 'pending' | 'reviewing' | 'done' | 'failed';
+  prState: 'open' | 'merged' | 'closed';
   verdict: string | null;
   severityCritical: number;
   severityHigh: number;
   lastReviewedAt: string | null;
+  closedAt: string | null;
 }
 
 export interface ListPageRowViewModel {
@@ -19,13 +21,16 @@ export interface ListPageRowViewModel {
   branch: string;
   author: string;
   isInProgress: boolean;
+  prState: 'open' | 'merged' | 'closed';
   badgeVerdict: BadgeVerdict;
   criticalHighCount: number | null;
   lastReviewedAt: string | null;
+  closedAt: string | null;
 }
 
 export function buildListRowViewModel(input: ListPageRowInput): ListPageRowViewModel {
-  const isInProgress = input.reviewStatus === 'reviewing' || input.reviewStatus === 'pending';
+  const isInProgress =
+    input.prState === 'open' && (input.reviewStatus === 'reviewing' || input.reviewStatus === 'pending');
   const isFailed = input.reviewStatus === 'failed';
 
   const hasPriorSuccess = input.lastReviewedAt !== null;
@@ -41,9 +46,11 @@ export function buildListRowViewModel(input: ListPageRowInput): ListPageRowViewM
     branch: input.branch,
     author: input.author,
     isInProgress,
+    prState: input.prState,
     badgeVerdict: isFailed ? 'failed' : ((input.verdict ?? 'needs_review') as BadgeVerdict),
     criticalHighCount,
     lastReviewedAt: input.lastReviewedAt,
+    closedAt: input.closedAt,
   };
 }
 
@@ -81,10 +88,12 @@ export function buildListPageViewModel(input: ListPageViewModelInput): ListPageV
           branch: pr.branch,
           author: pr.author,
           reviewStatus: pr.review_status,
+          prState: pr.pr_state,
           verdict: pr.verdict,
           severityCritical: pr.severity_critical,
           severityHigh: pr.severity_high,
           lastReviewedAt: pr.last_reviewed_at,
+          closedAt: pr.closed_at,
         })
       )
       // `getVisiblePrs()` (db/pullRequests.ts) already queries with
