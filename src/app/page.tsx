@@ -10,6 +10,7 @@ import { RecheckButton } from './components/RecheckButton';
 import { SeveritySummaryBar } from './components/SeveritySummaryBar';
 import { HoverLiftCard } from './components/HoverLiftCard';
 import { StaggerReveal } from './components/StaggerReveal';
+import { TimeStamp } from './components/TimeStamp';
 import { Card } from './components/ui/card';
 
 export const dynamic = 'force-dynamic';
@@ -79,10 +80,10 @@ export default function ListPage() {
                     <span className="font-mono text-sm text-muted-foreground">#{row.prNumber}</span>
                     <span className="font-medium text-foreground">{row.title}</span>
                   </div>
-                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-muted-foreground">
                     <span className="font-mono">{row.branch}</span>
                     <span>{row.author}</span>
-                    <span>Last reviewed {row.lastReviewedAt ?? '-'}</span>
+                    <TimeStamp iso={row.lastReviewedAt} label="Last reviewed" />
                   </div>
                 </div>
 

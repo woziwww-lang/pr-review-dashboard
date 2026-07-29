@@ -1,4 +1,5 @@
 import { TriangleAlert } from 'lucide-react';
+import { TimeStamp } from './TimeStamp';
 
 export function PollStatusBanner({
   lastPollAt,
@@ -11,7 +12,7 @@ export function PollStatusBanner({
 }) {
   return (
     <div className="flex flex-col gap-2">
-      <p className="text-sm text-muted-foreground">Last poll: {lastPollAt ?? 'never'}</p>
+      <TimeStamp iso={lastPollAt} label="Last poll" />
       {lastPollStatus === 'error' && (
         <div
           role="alert"

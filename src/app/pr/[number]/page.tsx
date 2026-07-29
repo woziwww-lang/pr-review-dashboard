@@ -12,6 +12,7 @@ import { FindingCard } from '../../components/FindingCard';
 import { HoverLiftCard } from '../../components/HoverLiftCard';
 import { RecheckButton } from '../../components/RecheckButton';
 import { SeverityDonut } from '../../components/SeverityDonut';
+import { TimeStamp } from '../../components/TimeStamp';
 import { Card } from '../../components/ui/card';
 
 export const dynamic = 'force-dynamic';
@@ -46,7 +47,10 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
         <h1 className="text-2xl font-semibold text-foreground">
           <span className="font-mono text-muted-foreground">#{vm.prNumber}</span> {vm.title}
         </h1>
-        <RecheckButton prNumber={vm.prNumber} disabled={isInProgress} />
+        <div className="flex items-center gap-3">
+          {!vm.failureBanner && <TimeStamp iso={pr.last_reviewed_at} label="Last reviewed" />}
+          <RecheckButton prNumber={vm.prNumber} disabled={isInProgress} />
+        </div>
       </div>
 
       {vm.failureBanner && vm.state === 'failed-with-prior-success' && (
@@ -55,10 +59,15 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
           className="flex items-start gap-2 border-[#451A03] bg-[#FBBF24]/10 p-4 text-sm text-[#FBBF24]"
         >
           <TriangleAlert className="h-4 w-4 shrink-0 translate-y-0.5" />
-          <span>
-            Latest re-check failed at {vm.failureBanner.lastAttemptedAt}: {vm.failureBanner.errorMessage}. Showing
-            results from the last successful review ({vm.failureBanner.lastReviewedAt}, commit{' '}
-            {vm.failureBanner.reviewedHeadSha}).
+          <span className="flex flex-col gap-1.5">
+            <span>
+              Latest re-check failed: {vm.failureBanner.errorMessage}. Showing results from the last successful
+              review (commit {vm.failureBanner.reviewedHeadSha}).
+            </span>
+            <span className="flex flex-wrap items-center gap-2">
+              <TimeStamp iso={vm.failureBanner.lastAttemptedAt} label="Failed at" />
+              <TimeStamp iso={vm.failureBanner.lastReviewedAt} label="Last success" />
+            </span>
           </span>
         </Card>
       )}
@@ -69,9 +78,9 @@ export default async function DetailPage({ params }: { params: Promise<{ number:
           className="flex items-start gap-2 border-[#450A0A] bg-[#F87171]/10 p-4 text-sm text-[#F87171]"
         >
           <TriangleAlert className="h-4 w-4 shrink-0 translate-y-0.5" />
-          <span>
-            Review failed at {vm.failureBanner.lastAttemptedAt}: {vm.failureBanner.errorMessage}. No successful review
-            yet.
+          <span className="flex flex-col gap-1.5">
+            <span>Review failed: {vm.failureBanner.errorMessage}. No successful review yet.</span>
+            <TimeStamp iso={vm.failureBanner.lastAttemptedAt} label="Failed at" />
           </span>
         </Card>
       )}
