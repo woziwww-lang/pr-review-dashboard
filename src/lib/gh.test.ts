@@ -5,7 +5,7 @@ vi.mock('node:child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
-const { fetchOpenPrs } = await import('./gh');
+const { fetchOpenPrs, getPrFinalState } = await import('./gh');
 
 describe('fetchOpenPrs', () => {
   beforeEach(() => {
@@ -62,5 +62,38 @@ describe('fetchOpenPrs', () => {
   it('rejects when gh exits non-zero (e.g. auth/network error)', async () => {
     execFileMock.mockImplementation((_cmd, _args, cb) => cb(new Error('gh: command not found'), '', ''));
     await expect(fetchOpenPrs('o/r')).rejects.toThrow('gh: command not found');
+  });
+});
+
+describe('getPrFinalState', () => {
+  beforeEach(() => {
+    execFileMock.mockReset();
+  });
+
+  it('maps a MERGED gh pr view result to "merged"', async () => {
+    execFileMock.mockImplementation((_cmd, _args, cb) => cb(null, JSON.stringify({ state: 'MERGED' }), ''));
+    const result = await getPrFinalState('o/r', 42);
+    expect(result).toBe('merged');
+    expect(execFileMock).toHaveBeenCalledWith(
+      'gh',
+      ['pr', 'view', '42', '--repo', 'o/r', '--json', 'state'],
+      expect.any(Function)
+    );
+  });
+
+  it('maps a CLOSED gh pr view result to "closed"', async () => {
+    execFileMock.mockImplementation((_cmd, _args, cb) => cb(null, JSON.stringify({ state: 'CLOSED' }), ''));
+    const result = await getPrFinalState('o/r', 42);
+    expect(result).toBe('closed');
+  });
+
+  it('rejects when gh exits non-zero', async () => {
+    execFileMock.mockImplementation((_cmd, _args, cb) => cb(new Error('gh: not found'), '', ''));
+    await expect(getPrFinalState('o/r', 42)).rejects.toThrow('gh: not found');
+  });
+
+  it('throws on an unexpected state value (e.g. still OPEN) rather than silently mislabeling it "closed"', async () => {
+    execFileMock.mockImplementation((_cmd, _args, cb) => cb(null, JSON.stringify({ state: 'OPEN' }), ''));
+    await expect(getPrFinalState('o/r', 42)).rejects.toThrow(/unexpected pr state/i);
   });
 });

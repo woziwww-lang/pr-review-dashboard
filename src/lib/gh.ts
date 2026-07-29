@@ -22,6 +22,12 @@ interface RawGhPr {
   isDraft: boolean;
 }
 
+export type PrFinalState = 'merged' | 'closed';
+
+interface RawGhPrState {
+  state: 'MERGED' | 'CLOSED' | 'OPEN';
+}
+
 // A hand-written Promise wrapper rather than `util.promisify(execFile)`:
 // promisify's multi-value (stdout, stderr) support for execFile relies on
 // Node internally tagging the real `execFile` with the
@@ -63,4 +69,21 @@ export async function fetchOpenPrs(repo: string): Promise<GhPrListItem[]> {
     url: r.url,
     isDraft: r.isDraft,
   }));
+}
+
+// Called only for a PR that has just disappeared from `fetchOpenPrs`'s
+// open-state result, to determine whether it was merged or closed
+// without merging (GitHub distinguishes these; a plain "closed" result
+// from `gh pr list --state open` cannot tell them apart, since it never
+// returns non-open PRs at all).
+export async function getPrFinalState(repo: string, prNumber: number): Promise<PrFinalState> {
+  const { stdout } = await execFileAsync('gh', [
+    'pr', 'view', String(prNumber),
+    '--repo', repo,
+    '--json', 'state',
+  ]);
+  const raw = JSON.parse(stdout) as RawGhPrState;
+  if (raw.state === 'MERGED') return 'merged';
+  if (raw.state === 'CLOSED') return 'closed';
+  throw new Error(`unexpected pr state "${raw.state}" for ${repo}#${prNumber}`);
 }
