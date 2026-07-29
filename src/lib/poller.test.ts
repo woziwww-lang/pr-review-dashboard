@@ -38,9 +38,11 @@ const basePrFromGh = {
 
 describe('runPollTick', () => {
   let db: ReturnType<typeof createTestDb>;
+  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     db = createTestDb();
+    consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     fetchOpenPrsMock.mockReset();
     getPrFinalStateMock.mockReset();
     ensureBareRepoMock.mockClear();
@@ -183,6 +185,10 @@ describe('runPollTick', () => {
     const row = getByNumber(db, 'owner/name', 1)!;
     expect(row.pr_state).toBe('closed');
     expect(row.closed_at).toBeTruthy();
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      'Failed to resolve final PR state for owner/name#1; falling back to closed:',
+      expect.any(Error)
+    );
   });
 
   it('deletes stale closed PRs after each poll tick', async () => {

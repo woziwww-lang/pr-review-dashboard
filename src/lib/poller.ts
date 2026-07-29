@@ -77,7 +77,11 @@ export async function runPollTick(db: Database.Database, repo: string): Promise<
     if (keepPrNumberSet.has(prNumber)) continue;
     try {
       finalStates[prNumber] = await getPrFinalState(repo, prNumber);
-    } catch {
+    } catch (err) {
+      console.error(
+        `Failed to resolve final PR state for ${repo}#${prNumber}; falling back to closed:`,
+        err
+      );
       finalStates[prNumber] = 'closed';
     }
   }
